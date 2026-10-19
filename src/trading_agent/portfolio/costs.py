@@ -140,7 +140,10 @@ class CostModel:
     version: str = "paper-v1"
     effective_date: date | None = None
     brokerage_rate: Decimal | str | float = Decimal("0")
+    brokerage_cap: Decimal | str | float | None = None
     transaction_fee_rate: Decimal | str | float = Decimal("0")
+    sebi_fee_rate: Decimal | str | float = Decimal("0")
+    ipft_fee_rate: Decimal | str | float = Decimal("0")
     buy_tax_rate: Decimal | str | float = Decimal("0")
     sell_tax_rate: Decimal | str | float = Decimal("0")
     gst_rate: Decimal | str | float = Decimal("0")
@@ -155,6 +158,8 @@ class CostModel:
         for field_name in (
             "brokerage_rate",
             "transaction_fee_rate",
+            "sebi_fee_rate",
+            "ipft_fee_rate",
             "buy_tax_rate",
             "sell_tax_rate",
             "gst_rate",
@@ -168,6 +173,11 @@ class CostModel:
                 raise ValueError(f"{field_name} must be non-negative")
             object.__setattr__(self, field_name, value)
         object.__setattr__(self, "version", self.version.strip())
+        if self.brokerage_cap is not None:
+            cap = decimal_value(self.brokerage_cap, "brokerage_cap")
+            if cap < 0:
+                raise ValueError("brokerage_cap must be non-negative")
+            object.__setattr__(self, "brokerage_cap", money(cap))
         if self.price_tick <= 0:
             raise ValueError("price_tick must be positive")
         if self.slippage_bps + self.spread_bps / 2 >= _BPS:
@@ -204,9 +214,13 @@ class CostModel:
         rate = self.buy_tax_rate if canonical_side == "BUY" else self.sell_tax_rate
         stamp = self.stamp_duty_buy_rate if canonical_side == "BUY" else Decimal("0")
         brokerage = money(execution_notional * self.brokerage_rate)
+        if self.brokerage_cap is not None:
+            brokerage = min(brokerage, self.brokerage_cap)
         transaction = money(execution_notional * self.transaction_fee_rate)
+        sebi = money(execution_notional * self.sebi_fee_rate)
+        ipft = money(execution_notional * self.ipft_fee_rate)
         tax = money(execution_notional * rate)
-        gst = money((brokerage + transaction) * self.gst_rate)
+        gst = money((brokerage + transaction + sebi + ipft) * self.gst_rate)
         stamp_duty = money(execution_notional * stamp)
         components = (
             ("brokerage", brokerage),
@@ -215,6 +229,10 @@ class CostModel:
             ("gst", gst),
             ("stamp_duty", stamp_duty),
         )
+        if self.sebi_fee_rate:
+            components += (("sebi_fee", sebi),)
+        if self.ipft_fee_rate:
+            components += (("ipft_fee", ipft),)
         fees_total = sum((amount for _, amount in components), Decimal("0"))
         cash_effect = (
             -(execution_notional + fees_total)

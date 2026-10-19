@@ -130,7 +130,7 @@ def load_market(path: str | Path, config: Mapping[str, Any]) -> tuple[MarketBar,
     calendar = SessionCalendar(holidays=config["risk"]["closed_dates"])
     calendar.validate_intraday_bars(bars, bars[0].symbol, start=bars[0].timestamp, end=bars[-1].timestamp + FIVE_MINUTES, as_of=datetime.now(timezone.utc))
     for previous, current in zip(bars, bars[1:]):
-        if abs(float(current.open / previous.close) - 1) > 0.20 or abs(float(current.close / current.open) - 1) > 0.20:
+        if abs(float(current.open / previous.close) - 1) > 0.20 or abs(float(current.close / current.open) - 1) > 0.20 or current.high / current.open > Decimal("1.20") or current.low / current.open < Decimal("0.80"):
             raise DataValidationError("20% price outlier/corporate-action discontinuity needs explicit review")
     return bars
 
@@ -179,6 +179,7 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
     manifest_file = output / "experiment.json"
     bars = load_market(data, config)
     plan = experiment_plan(bars, config)
+    plan["selection"] = f"fixed seed {seed}; fixed config; no holdout-driven selection"
     train_bars = bars[slice(*plan["train"])]
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "candidate.pt"
@@ -187,6 +188,7 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
         if not resume:
             raise FileExistsError("experiment exists; use --resume or a new --output")
         report = read_json(manifest_file)
+        checkpoint = output / report["checkpoint"]
         if report["dataset_hash"] != dataset_digest or report["config"] != config or report["seed"] != seed:
             raise ValueError("resume dataset, configuration or seed mismatch")
         if report.get("checkpoint_sha256") != file_hash(checkpoint):
@@ -216,6 +218,9 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
         }
         if experience_db is not None:
             # Reject data after the training cutoff, never learn from this run's held-out demo.
+            experience_spec = read_json(str(experience_db) + ".spec.json")
+            if experience_spec["config"] != config or experience_spec["provenance"] != report["provenance"]:
+                raise ValueError("paper experience provenance/action/risk/cost configuration mismatch")
             with SQLiteRepository(experience_db) as repo:
                 rows = [json.loads(row["payload"]) for row in repo.transitions()]
             for row in rows:
@@ -231,6 +236,8 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
     if device.startswith("cuda"):
         trainer.torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
+    immutable_checkpoints = output / "checkpoints"
+    immutable_checkpoints.mkdir(exist_ok=True)
     remaining = budget
     while remaining:
         chunk = min(remaining, config["training"]["checkpoint_every"])
@@ -239,7 +246,13 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
         report["loss_history"].append({"step": trainer.environment_steps, "mean_huber_loss": statistics.fmean(losses) if losses else None})
         report.update(steps=trainer.environment_steps, updates=trainer.gradient_steps, device=str(trainer.device))
         report["training_seconds"] += time.perf_counter() - start
+        # Publish a new version before moving the manifest pointer. A crash can
+        # leave an orphan new checkpoint, but never destroys the previous pair.
+        checkpoint = immutable_checkpoints / f"step-{trainer.environment_steps:08d}.pt"
+        if checkpoint.exists():
+            raise FileExistsError("checkpoint version exists; inspect an interrupted run before retrying")
         trainer.save_checkpoint(checkpoint)
+        report["checkpoint"] = os.path.relpath(checkpoint, output)
         report["checkpoint_sha256"] = file_hash(checkpoint)
         report["peak_vram_bytes"] = trainer.torch.cuda.max_memory_allocated() if device.startswith("cuda") else None
         save_json(manifest_file, report)
@@ -249,6 +262,8 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
     loaded = DQNTrainer.load_checkpoint(checkpoint, device="cpu")
     observation, _ = env.reset(seed=seed)
     report["reloaded_action"] = loaded.act(observation)
+    # Convenience alias is never the resumable source of truth.
+    trainer.save_checkpoint(output / "candidate.pt")
     save_json(manifest_file, report)
     return report
 

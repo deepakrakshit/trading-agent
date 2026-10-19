@@ -364,6 +364,8 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         if self._done:
             raise RuntimeError("step() called after the episode ended; use a fresh episode/account")
         current, following = self.bars[self._index], self.bars[self._index + 1]
+        if following.timestamp < current.timestamp + self.bar_interval:
+            raise ValueError("next open precedes completion of the decision candle")
         clock = utc_timestamp(as_of) if as_of is not None else following.timestamp
         if clock < following.timestamp:
             raise ValueError("step clock cannot precede the eligible next-open event")
@@ -417,6 +419,8 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                     action=action, target_exposure=requested, executed_target_exposure=target,
                     transition_id=identifier, decision_index=self._index - 1,
                     decision_timestamp=current.timestamp, fill_index=self._index,
+                    decision_available_at=current.timestamp + self.bar_interval,
+                    reward_available_at=following.timestamp + self.bar_interval,
                     fill_timestamp=following.timestamp, fill_open=float(following.open),
                     previous_equity=float(previous.equity),
                     realized_fees=float(sum((fill.fees for fill in fills), Decimal("0"))),
@@ -584,8 +588,8 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
     def _decision_context(self, bar: MarketBar, as_of: datetime | None) -> RiskContext:
         snapshot = self.ledger.snapshot()
         return RiskContext(
-            timestamp=utc_timestamp(as_of) if as_of is not None else bar.timestamp,
-            feed_timestamp=bar.timestamp, cash=snapshot.cash, equity=snapshot.equity,
+            timestamp=utc_timestamp(as_of) if as_of is not None else bar.timestamp + self.bar_interval,
+            feed_timestamp=bar.timestamp + self.bar_interval, cash=snapshot.cash, equity=snapshot.equity,
             high_water_mark=snapshot.high_water_mark, session_start_equity=self.broker.session_start_equity,
             positions={symbol: position.quantity for symbol, position in snapshot.positions.items()},
             marks=self.ledger.last_prices,
@@ -698,7 +702,7 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
     @staticmethod
     def _restore_info(payload: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(dict(payload))
-        for name in ("timestamp", "decision_timestamp", "fill_timestamp"):
+        for name in ("timestamp", "decision_timestamp", "fill_timestamp", "decision_available_at", "reward_available_at"):
             if isinstance(result.get(name), str):
                 result[name] = datetime.fromisoformat(result[name])
         return result

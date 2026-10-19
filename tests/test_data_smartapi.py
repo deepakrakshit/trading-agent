@@ -79,7 +79,7 @@ def candle(time, *, day="2026-01-05", **changes):
 
 
 def quote(clock, *, feed=None, **changes):
-    row = {"exchange": "NSE", "symbolToken": INSTRUMENT, "tradingSymbol": SYMBOL, "ltp": "100.1234", "exchFeedTime": (feed or clock.now()).isoformat()}
+    row = {"exchange": "NSE", "symbolToken": INSTRUMENT, "tradingSymbol": SYMBOL, "ltp": "100.1234", "exchFeedTime": (feed or clock.now()).isoformat(), "exchTradeTime": (feed or clock.now()).isoformat()}
     row.update(changes)
     return ok({"fetched": [row], "unfetched": []})
 
@@ -248,6 +248,14 @@ def test_stale_or_future_exchange_timestamp_is_rejected_not_replaced_with_receip
     clock = Clock()
     transport = Transport(clock, quote(clock, feed=clock.now() - age))
     with pytest.raises(StaleQuoteError):
+        SmartAPIQuoteProvider(client(clock, transport)).get_quote(SYMBOL)
+
+
+@pytest.mark.parametrize("trade_time", [None, "2026-01-05T09:00:00+05:30"])
+def test_fresh_heartbeat_does_not_make_old_or_undated_last_trade_live(trade_time):
+    clock = Clock()
+    transport = Transport(clock, quote(clock, exchTradeTime=trade_time))
+    with pytest.raises(StaleQuoteError, match="heartbeat"):
         SmartAPIQuoteProvider(client(clock, transport)).get_quote(SYMBOL)
 
 

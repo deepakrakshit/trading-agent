@@ -45,14 +45,17 @@ def attribute_round_trips(records: Sequence[dict], bars: Sequence[MarketBar]) ->
                 "simulated": True,
             })
             if quantity == 0:
-                path = bars[entry_index:record["next_index"] + 1]
+                # The exit executes at the next OPEN, so its later H/L are not
+                # part of the holding interval. Include the exit reference only.
+                path = bars[entry_index:record["next_index"]]
+                exit_price = Decimal(cost["reference_price"])
                 closed.append({
                     "entry_timestamp": bars[entry_index].timestamp.isoformat(),
                     "exit_timestamp": fill["occurred_at"],
                     "gross_reference_pnl": str(gross), "execution_effect": str(-execution),
                     "fees": str(fees), "net_pnl": str(gross - execution - fees),
-                    "mfe_fraction": float(max(bar.high for bar in path) / initial_price - 1),
-                    "mae_fraction": float(min(bar.low for bar in path) / initial_price - 1),
+                    "mfe_fraction": float(max(exit_price, initial_price, *(bar.high for bar in path)) / initial_price - 1),
+                    "mae_fraction": float(min(exit_price, initial_price, *(bar.low for bar in path)) / initial_price - 1),
                     "holding_bars": record["next_index"] - entry_index,
                     "market_cause": "UNKNOWN: no trustworthy event/news feed supplied",
                 })

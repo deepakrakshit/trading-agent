@@ -439,6 +439,8 @@ class SmartAPIQuoteProvider:
             raise StaleQuoteError("SmartAPI quote is stale or future-dated")
         if trade_time is not None and trade_time - received > self.future_tolerance:
             raise StaleQuoteError("SmartAPI quote trade timestamp is future-dated")
+        if trade_time is None or received - trade_time > self.max_age:
+            raise StaleQuoteError("SmartAPI last-traded price is stale or lacks a trade timestamp; a fresh heartbeat is insufficient")
         if not self.calendar.is_open(timestamp) or not self.calendar.is_open(received):
             raise StaleQuoteError("SmartAPI quote is outside the configured session")
         if symbol in self._last_timestamp and timestamp < self._last_timestamp[symbol]:

@@ -6,7 +6,10 @@
   "costs": {
     "version": "illustrative-intraday-2026-10-19-v1",
     "brokerage_rate": "0.0003",
+    "brokerage_cap": "20",
     "transaction_fee_rate": "0.0000307",
+    "sebi_fee_rate": "0.000001",
+    "ipft_fee_rate": "0.000000001",
     "buy_tax_rate": "0",
     "sell_tax_rate": "0.00025",
     "gst_rate": "0.18",
