@@ -360,6 +360,7 @@ class SingleInstrumentTradingEnv(_EnvBase):
             "shares": self._shares,
             "equity": self._equity,
             "drawdown": self.drawdown,
+            "exposure": self._shares * bar.close / self._equity if self._equity > 0 else 0.0,
         }
         result.update(extra)
         return result
