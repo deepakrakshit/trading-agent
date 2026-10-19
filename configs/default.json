@@ -1,0 +1,68 @@
+{
+  "version": "nse-paper-research-v1",
+  "initial_cash": 10000,
+  "target_exposures": [0.0, 0.0625, 0.125, 0.1875, 0.25],
+  "participation_limit": "0.01",
+  "costs": {
+    "version": "illustrative-intraday-2026-10-19-v1",
+    "brokerage_rate": "0.0003",
+    "transaction_fee_rate": "0.0000307",
+    "buy_tax_rate": "0",
+    "sell_tax_rate": "0.00025",
+    "gst_rate": "0.18",
+    "stamp_duty_buy_rate": "0.00003",
+    "spread_bps": "4",
+    "slippage_bps": "3",
+    "price_tick": "0.05"
+  },
+  "risk": {
+    "version": "nse-long-only-25pct-v1",
+    "max_gross_exposure": "0.25",
+    "max_symbol_weight": "0.25",
+    "daily_loss_limit": "0.02",
+    "max_drawdown": "0.10",
+    "stale_seconds": 600,
+    "market_open": "09:15",
+    "market_close": "15:30",
+    "closed_dates": [],
+    "max_order_quantity": 250,
+    "max_order_notional": "3000",
+    "min_order_seconds": 300,
+    "max_orders_per_session": 60
+  },
+  "training": {
+    "steps": 3000,
+    "walk_forward_steps": 1000,
+    "seeds": [0, 1, 2],
+    "episode_length": 149,
+    "hidden_sizes": [32, 32],
+    "batch_size": 32,
+    "replay_capacity": 5000,
+    "learning_starts": 64,
+    "train_frequency": 4,
+    "target_update_interval": 100,
+    "learning_rate": 0.0003,
+    "gamma": 0.99,
+    "epsilon_decay_steps": 2500,
+    "checkpoint_every": 500
+  },
+  "evaluation": {
+    "train_fraction": 0.50,
+    "validation_fraction": 0.125,
+    "holdout_fraction": 0.25,
+    "purge_bars": 5,
+    "embargo_bars": 1
+  },
+  "promotion": {
+    "min_sessions": 20,
+    "min_trades": 10,
+    "min_windows": 2,
+    "min_seeds": 3,
+    "min_regimes": 2,
+    "min_net_return": 0.0,
+    "max_drawdown": 0.10,
+    "max_expected_shortfall": 0.02,
+    "require_shadow": true,
+    "require_recovery": true
+  }
+}
