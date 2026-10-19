@@ -160,6 +160,8 @@ def paper_report(spec: dict, bars, env) -> dict:
         "rejections": sum(len(row["info"]["rejections"]) for row in records),
         "liquidation_unfilled": env.render().get("liquidation_unfilled", False),
         "closed_round_trips": len(attribution["closed_round_trips"]),
+        "total_execution_cost": str(sum((Decimal(fill["execution_cost"]) for fill in attribution["fills"]), Decimal("0"))),
+        "failed_liquidations": sum(bool(row["info"]["liquidation_unfilled"]) for row in records),
         "attribution": attribution,
         "note": "Simulated fills only. Replay is not a genuinely streaming live trial.",
     }

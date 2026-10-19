@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Installs only in this project's .venv. No sudo, driver or global package changes.
 set -euo pipefail
+export PIP_CACHE_DIR="$PWD/.cache/pip"
 if [[ ! -f pyproject.toml || ! -f requirements.lock ]]; then
   printf 'Run this script from the project root.\n' >&2
   exit 1

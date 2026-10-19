@@ -41,6 +41,7 @@ def test_persistent_split_replay_matches_uninterrupted_execution(experiment, tmp
     assert resumed["metrics"] == full["metrics"]
     assert resumed["attribution"] == full["attribution"]
     assert resumed["metrics"]["trades"] > 0 and float(resumed["account"]["fees_paid"]) > 0
+    assert resumed["closed_round_trips"] > 0 and float(resumed["total_execution_cost"]) > 0
     assert run_paper(None, partial_db, resume=True) == resumed
     assert len(inspect_account(partial_db, view="fills")) == resumed["metrics"]["trades"]
     summary = inspect_account(partial_db)
