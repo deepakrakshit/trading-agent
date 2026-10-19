@@ -472,6 +472,25 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
             if self.repository:
                 self._save_cursor()
 
+    def set_kill_switch(self, enabled: bool, *, reason: str = "operator stop") -> None:
+        """Operator-only control: cancel local pending intents, retain holdings.
+
+        No flattening is attempted with a stale or missing quote. The broker and
+        environment cursor remain one atomic restart boundary.
+        """
+        if not isinstance(enabled, bool):
+            raise ValueError("kill switch state must be boolean")
+        with self.broker.atomic():
+            self._assert_current_cursor()
+            if enabled:
+                self.risk_supervisor.engage_kill_switch(reason)
+                self.broker.cancel_pending("operator kill switch: local intent cancelled")
+            else:
+                self.risk_supervisor.clear_kill_switch()
+            self.broker.checkpoint()
+            if self.repository:
+                self._save_cursor()
+
     def transition_records(self) -> tuple[dict[str, Any], ...]:
         """Return detached, policy-versioned numerical/audit replay records."""
 
