@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from math import isfinite
 from typing import Any, Mapping
 
 
@@ -80,8 +81,15 @@ class MarketBar:
         volume = decimal_value(self.volume, "volume")
         if min(open_price, high_price, low_price, close_price) <= 0:
             raise DataValidationError("OHLC prices must be positive")
+        if any(
+            not isfinite(float(price)) or float(price) == 0
+            for price in (open_price, high_price, low_price, close_price)
+        ):
+            raise DataValidationError("OHLC prices exceed supported numeric range")
         if volume < 0:
             raise DataValidationError("volume must be non-negative")
+        if not isfinite(float(volume)):
+            raise DataValidationError("volume exceeds supported numeric range")
         if high_price < max(open_price, close_price):
             raise DataValidationError("high must be at least open and close")
         if low_price > min(open_price, close_price):

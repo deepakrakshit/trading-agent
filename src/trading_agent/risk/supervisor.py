@@ -219,10 +219,15 @@ class RiskSupervisor:
         mark and current equity; no order is submitted by this method.
         """
 
-        if side.upper() not in ("BUY", "SELL"):
+        if not isinstance(side, str) or side.upper() not in ("BUY", "SELL"):
             return RiskDecision(False, {}, ("unsupported side",), self.limits.version, self._kill_switch)
         if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
             return RiskDecision(False, {}, ("quantity must be a positive whole number",), self.limits.version, self._kill_switch)
+        if any(
+            isinstance(holding, bool) or not isinstance(holding, int) or holding < 0
+            for holding in context.positions.values()
+        ):
+            return self.evaluate({}, context)
         current = context.positions.get(symbol, 0)
         if side.upper() == "SELL" and quantity > current:
             return RiskDecision(False, {}, ("sell quantity exceeds holding",), self.limits.version, self._kill_switch)

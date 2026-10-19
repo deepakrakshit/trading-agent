@@ -26,6 +26,8 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(cost.cash_effect, D("-1020.10"))
         ledger = PortfolioLedger(2000)
         ledger.apply_fill(fill("BUY", 10, "100", order_id="buy", model=model))
+        self.assertEqual(ledger.snapshot().equity, D("1979.90"))
+        self.assertEqual(ledger.snapshot().unrealized_pnl, -cost.total_cost)
         snapshot = ledger.mark_to_market({"ABC": 100})
         self.assertEqual(snapshot.cash, D("979.90"))
         self.assertEqual(snapshot.equity, D("1979.90"))

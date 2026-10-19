@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from math import log, sqrt
+from math import isfinite, log, sqrt
 from typing import Any, Iterable
 
-from ..data import MarketBar, validate_bars
+from ..data import DataValidationError, MarketBar, validate_bars
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +66,9 @@ class CausalFeatureBuilder:
             close = float(bar.close)
             current_return: float | None = None
             if previous_close is not None:
-                current_return = log(close / previous_close)
+                current_return = log(close) - log(previous_close)
                 returns.append(current_return)
-            prior_volume_mean = sum(volumes) / len(volumes) if volumes else None
+            prior_volume_mean = sum(item / len(volumes) for item in volumes) if volumes else None
             volume_ratio = (
                 float(bar.volume) / prior_volume_mean
                 if prior_volume_mean is not None and prior_volume_mean > 0
@@ -80,16 +80,20 @@ class CausalFeatureBuilder:
                 mean = sum(returns) / len(returns)
                 variance = sum((item - mean) ** 2 for item in returns) / len(returns)
                 volatility = sqrt(variance)
-            rows.append(
-                FeatureRow(
-                    symbol=bar.symbol,
-                    timestamp=bar.timestamp,
-                    close=close,
-                    log_return=current_return,
-                    range_pct=float((bar.high - bar.low) / bar.close),
-                    volume_ratio=volume_ratio,
-                    rolling_volatility=volatility,
-                )
+            row = FeatureRow(
+                symbol=bar.symbol,
+                timestamp=bar.timestamp,
+                close=close,
+                log_return=current_return,
+                range_pct=float((bar.high - bar.low) / bar.close),
+                volume_ratio=volume_ratio,
+                rolling_volatility=volatility,
             )
+            values = (row.close, row.log_return, row.range_pct, row.volume_ratio, row.rolling_volatility)
+            if any(value is not None and not isfinite(value) for value in values):
+                raise DataValidationError(
+                    f"non-finite feature for {bar.symbol} at {bar.timestamp.isoformat()}"
+                )
+            rows.append(row)
             previous_closes[bar.symbol] = close
         return tuple(rows)

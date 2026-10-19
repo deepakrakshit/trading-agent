@@ -6,6 +6,7 @@ portfolio-changing actions terminate at :class:`PaperBroker`.
 """
 
 from .data import (
+    CSVBarProvider,
     DataProvenance,
     DataValidationError,
     InMemoryBarProvider,
@@ -33,6 +34,7 @@ __all__ = [
     "CausalFeatureBuilder",
     "CostBreakdown",
     "CostModel",
+    "CSVBarProvider",
     "DataProvenance",
     "DataValidationError",
     "ExecutionReceipt",

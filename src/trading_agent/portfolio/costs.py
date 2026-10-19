@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
-from typing import Literal
+from typing import Any, Literal, Mapping, cast
 
 from ..data.bars import decimal_value
 
@@ -26,7 +26,7 @@ def normalise_side(side: str) -> Side:
     value = side.upper() if isinstance(side, str) else ""
     if value not in ("BUY", "SELL"):
         raise ValueError("side must be BUY or SELL")
-    return value  # type: ignore[return-value]
+    return cast(Side, value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +47,38 @@ class CostBreakdown:
     execution_cost: Decimal
     fee_components: tuple[tuple[str, Decimal], ...]
     cash_effect: Decimal
+    model_version: str = "paper-v1"
+
+    def __post_init__(self) -> None:
+        if self.side not in ("BUY", "SELL"):
+            raise ValueError("invalid cost side")
+        if isinstance(self.quantity, bool) or not isinstance(self.quantity, int) or self.quantity <= 0:
+            raise ValueError("cost quantity must be a positive whole number")
+        for name in ("reference_price", "execution_price", "reference_notional", "execution_notional", "execution_cost", "cash_effect"):
+            object.__setattr__(self, name, decimal_value(getattr(self, name), name))
+        if min(self.reference_price, self.execution_price) <= 0:
+            raise ValueError("cost prices must be positive")
+        if self.reference_notional != money(self.reference_price * self.quantity):
+            raise ValueError("reference notional does not reconcile")
+        if self.execution_notional != money(self.execution_price * self.quantity):
+            raise ValueError("execution notional does not reconcile")
+        if self.execution_cost != abs(self.execution_notional - self.reference_notional):
+            raise ValueError("execution cost does not reconcile")
+        components = tuple(sorted((name, decimal_value(amount, name)) for name, amount in self.fee_components))
+        if len({name for name, _ in components}) != len(components):
+            raise ValueError("duplicate fee component")
+        if any(amount < 0 or amount != money(amount) for _, amount in components):
+            raise ValueError("fees must be non-negative integer-paise amounts")
+        object.__setattr__(self, "fee_components", components)
+        expected_cash = (
+            -self.execution_notional - self.fees_total
+            if self.side == "BUY"
+            else self.execution_notional - self.fees_total
+        )
+        if self.cash_effect != expected_cash:
+            raise ValueError("cash effect does not reconcile")
+        if not self.model_version.strip():
+            raise ValueError("cost version must be non-empty")
 
     @property
     def fees_total(self) -> Decimal:
@@ -75,7 +107,25 @@ class CostBreakdown:
             "fees_total": str(self.fees_total),
             "total_cost": str(self.total_cost),
             "cash_effect": str(self.cash_effect),
+            "model_version": self.model_version,
         }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "CostBreakdown":
+        """Restore and reconcile a persisted cost record."""
+
+        return cls(
+            side=normalise_side(payload["side"]),
+            quantity=payload["quantity"],
+            reference_price=payload["reference_price"],
+            execution_price=payload["execution_price"],
+            reference_notional=payload["reference_notional"],
+            execution_notional=payload["execution_notional"],
+            execution_cost=payload["execution_cost"],
+            fee_components=tuple(payload["fee_components"].items()),
+            cash_effect=payload["cash_effect"],
+            model_version=payload["model_version"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,4 +231,5 @@ class CostModel:
             execution_cost=execution_cost,
             fee_components=components,
             cash_effect=cash_effect,
+            model_version=self.version,
         )

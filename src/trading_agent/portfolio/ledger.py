@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR
@@ -80,6 +81,20 @@ class LedgerFill:
             "cost": self.cost.to_mapping(),
         }
 
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "LedgerFill":
+        """Restore a persisted fill, revalidating its cost reconciliation."""
+
+        return cls(
+            fill_id=payload["fill_id"],
+            client_order_id=payload["client_order_id"],
+            symbol=payload["symbol"],
+            side=payload["side"],
+            quantity=payload["quantity"],
+            occurred_at=utc_timestamp(datetime.fromisoformat(payload["occurred_at"])),
+            cost=CostBreakdown.from_mapping(payload["cost"]),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AccountSnapshot:
@@ -89,6 +104,7 @@ class AccountSnapshot:
     equity: Decimal
     positions: Mapping[str, Position]
     realized_pnl: Decimal
+    unrealized_pnl: Decimal
     fees_paid: Decimal
     high_water_mark: Decimal
     drawdown: Decimal
@@ -105,6 +121,7 @@ class AccountSnapshot:
                 for symbol, position in self.positions.items()
             },
             "realized_pnl": str(self.realized_pnl),
+            "unrealized_pnl": str(self.unrealized_pnl),
             "fees_paid": str(self.fees_paid),
             "high_water_mark": str(self.high_water_mark),
             "drawdown": str(self.drawdown),
@@ -123,9 +140,10 @@ class PortfolioLedger:
     """
 
     def __init__(self, initial_cash: Decimal | str | float) -> None:
-        cash = money(initial_cash)
-        if cash < 0:
+        raw_cash = decimal_value(initial_cash, "initial_cash")
+        if raw_cash < 0:
             raise ValueError("initial_cash must be finite and non-negative")
+        cash = money(raw_cash)
         self._cash = cash
         self._positions: dict[str, Position] = {}
         self._last_prices: dict[str, Decimal] = {}
@@ -161,7 +179,15 @@ class PortfolioLedger:
     def applied_fill_ids(self) -> frozenset[str]:
         return frozenset(self._applied_fill_ids)
 
+    @property
+    def last_prices(self) -> dict[str, Decimal]:
+        """Return detached marks used in the current equity calculation."""
+
+        return dict(self._last_prices)
+
     def position_quantity(self, symbol: str) -> int:
+        """Return the held whole-share quantity, including zero when absent."""
+
         return self._positions.get(symbol, Position(0, Decimal("0"))).quantity
 
     def mark_to_market(
@@ -187,10 +213,13 @@ class PortfolioLedger:
             timestamp = utc_timestamp(timestamp)
             if self._last_timestamp is not None and timestamp < self._last_timestamp:
                 raise LedgerError("mark timestamp cannot move backwards")
+        equity = money(self._cash + sum(
+            (position.quantity * updated_prices[symbol] for symbol, position in self._positions.items()),
+            Decimal("0"),
+        ))
         self._last_prices = updated_prices
         if timestamp is not None:
             self._last_timestamp = timestamp
-        equity = self._equity()
         if equity > self._high_water_mark:
             self._high_water_mark = equity
         return self.snapshot()
@@ -238,7 +267,9 @@ class PortfolioLedger:
                 del self._positions[fill.symbol]
         self._cash = cash_after
         self._fees_paid += fees
-        self._last_prices[fill.symbol] = fill.execution_price
+        # Reference marks expose the adverse execution effect immediately.
+        # Marking at the slipped fill price would temporarily conceal the cost.
+        self._last_prices[fill.symbol] = fill.reference_price
         self._applied_fill_ids.add(fill.fill_id)
         self._fill_records[fill.fill_id] = fill.to_mapping()
         self._applied_order_ids.add(fill.client_order_id)
@@ -293,6 +324,11 @@ class PortfolioLedger:
             equity=equity,
             positions=dict(self._positions),
             realized_pnl=self._realized_pnl,
+            unrealized_pnl=money(sum(
+                (position.quantity * self._last_prices[symbol] - position.cost_basis
+                 for symbol, position in self._positions.items()),
+                Decimal("0"),
+            )),
             fees_paid=self._fees_paid,
             high_water_mark=self._high_water_mark,
             drawdown=drawdown,
@@ -310,7 +346,7 @@ class PortfolioLedger:
             },
             "last_prices": {symbol: str(price) for symbol, price in self._last_prices.items()},
             "applied_fill_ids": sorted(self._applied_fill_ids),
-            "fill_records": self._fill_records.copy(),
+            "fill_records": deepcopy(self._fill_records),
             "applied_order_ids": sorted(self._applied_order_ids),
             "realized_pnl": str(self._realized_pnl),
             "fees_paid": str(self._fees_paid),
@@ -318,11 +354,19 @@ class PortfolioLedger:
             "last_timestamp": self._last_timestamp.isoformat() if self._last_timestamp else None,
         }
 
+    def restore_state(self, state: Mapping[str, Any]) -> None:
+        """Atomically replace this instance with validated persisted state."""
+
+        restored = self.from_state(state)
+        self.__dict__.update(restored.__dict__)
+
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "PortfolioLedger":
         """Restore a ledger exported by :meth:`export_state`."""
 
         ledger = cls(state["cash"])
+        if ledger.cash != decimal_value(state["cash"], "cash"):
+            raise LedgerError("persisted cash must be an integer-paise amount")
         ledger._positions = {
             symbol: Position(values["quantity"], decimal_value(values["cost_basis"], "cost_basis"))
             for symbol, values in state.get("positions", {}).items()
@@ -332,7 +376,7 @@ class PortfolioLedger:
             for symbol, price in state.get("last_prices", {}).items()
         }
         ledger._applied_fill_ids = set(state.get("applied_fill_ids", ()))
-        ledger._fill_records = dict(state.get("fill_records", {}))
+        ledger._fill_records = deepcopy(state.get("fill_records", {}))
         ledger._applied_order_ids = set(state.get("applied_order_ids", ()))
         ledger._realized_pnl = decimal_value(state.get("realized_pnl", "0"), "realized_pnl")
         ledger._fees_paid = decimal_value(state.get("fees_paid", "0"), "fees_paid")

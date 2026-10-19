@@ -1,10 +1,12 @@
 """Provider/schema boundary tests; also runnable with stdlib unittest."""
 
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 from trading_agent.data import (
+    CSVBarProvider,
     DataValidationError,
     InMemoryBarProvider,
     MarketBar,
@@ -21,7 +23,7 @@ class MarketDataTests(unittest.TestCase):
     def test_schema_rejects_missing_and_impossible_values(self) -> None:
         with self.assertRaisesRegex(DataValidationError, "missing.*volume"):
             MarketBar.from_mapping({"symbol": "ABC", "timestamp": START, "open": 10, "high": 11, "low": 9, "close": 10})
-        for field, value in (("open", 0), ("high", 8), ("low", 12), ("close", "NaN"), ("volume", -1), ("complete", False)):
+        for field, value in (("open", 0), ("open", "1e1000"), ("open", "1e-1000"), ("high", 8), ("low", 12), ("close", "NaN"), ("volume", -1), ("volume", "1e1000"), ("complete", False)):
             with self.subTest(field=field), self.assertRaises(DataValidationError):
                 values = dict(symbol="ABC", timestamp=START, open=10, high=11, low=9, close=10, volume=100)
                 values[field] = value
@@ -65,3 +67,16 @@ class MarketDataTests(unittest.TestCase):
         self.assertEqual(validate_bars(zero_volume), zero_volume)
         with self.assertRaisesRegex(DataValidationError, "volume"):
             validate_bars(zero_volume, require_positive_volume=True)
+
+    def test_csv_provider_round_trip_and_duplicate_rejection(self) -> None:
+        with TemporaryDirectory(dir=".") as directory:
+            path = Path(directory) / "bars.csv"
+            row = "ABC,2026-01-05T09:30:00+05:30,10,11,9,10,100\n"
+            header = "symbol,timestamp,open,high,low,close,volume\n"
+            path.write_text(header + row, encoding="utf-8")
+            provider = CSVBarProvider(path)
+            self.assertEqual(provider.provenance, "HISTORICAL")
+            self.assertEqual(provider.all_bars()[0].timestamp, START)
+            path.write_text(header + row + row, encoding="utf-8")
+            with self.assertRaisesRegex(DataValidationError, "duplicate"):
+                CSVBarProvider(path)
