@@ -287,10 +287,13 @@ def _aggregate_summary(policy_id: str, rows: list[dict], key: str, comparison_ke
         windows.setdefault(bounds, []).append((metric["net_return"], row["regime"]))
     compound = [math.prod(1 + item["net_return"] for item in values) - 1 for values in by_seed.values()]
     flattened = [item for values in by_seed.values() for item in values]
+    # Disjoint bar windows can still split the same exchange session. Do not
+    # count a boundary date twice, or count seeds as independent market dates.
+    sessions = {label for row in rows for label in row["session_ids"]}
     metrics = PerformanceMetrics(
         net_return=statistics.median(compound),
         max_drawdown=max(item["max_drawdown"] for item in flattened),
-        sessions=min(sum(item["sessions"] for item in values) for values in by_seed.values()),
+        sessions=len(sessions),
         trades=int(statistics.median(sum(item["trades"] for item in values) for values in by_seed.values())),
         expected_shortfall=max(item["expected_shortfall"] or 0 for item in flattened),
         total_fees=statistics.fmean(sum(item["total_fees"] for item in values) for values in by_seed.values()),
@@ -301,6 +304,23 @@ def _aggregate_summary(policy_id: str, rows: list[dict], key: str, comparison_ke
         tuple(EvaluationWindow(start, end, statistics.median(value[0] for value in values), values[0][1]) for (start, end), values in sorted(windows.items())),
         tuple(seeds),
     )
+
+
+def _session_audit(report: dict, bars, output: Path) -> dict:
+    """Annotate old receipts without recomputing or overwriting holdout scores."""
+    dates = {
+        bar.timestamp.astimezone(KOLKATA).date().isoformat()
+        for fold in report["plan"]["folds"]
+        for bar in bars[fold["test_start"] + 1:fold["test_end"]]
+    }
+    recorded = report["walk_forward_summary"]["metrics"]["sessions"]
+    audit = {
+        "unique_exchange_dates": sorted(dates), "unique_session_count": len(dates),
+        "original_reported_count": recorded, "counts_match": len(dates) == recorded,
+        "note": "Disjoint intraday windows may share a date. Existing holdout scores and immutable promotion receipts are not rerun/rewritten.",
+    }
+    save_json(output / "evaluation_session_audit.json", audit)
+    return report | {"session_count_audit": audit}
 
 
 def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sqlite", device="cpu") -> dict:
@@ -316,7 +336,7 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
         raise ValueError("candidate checkpoint changed since training")
     destination = output / "evaluation.json"
     if destination.exists():
-        return read_json(destination)  # Never tune/re-evaluate a consumed holdout.
+        return _session_audit(read_json(destination), bars, output)  # Never re-evaluate a consumed holdout.
     from .evaluation import WalkForwardSplit
     rows = []
     plan = manifest["plan"]
@@ -346,6 +366,7 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
             baselines = evaluate_baselines(lambda: factory(test), seed=seed)
             row = {
                 "split": definition, "seed": seed, "training_seconds": duration,
+                "session_ids": sorted({stamp.astimezone(KOLKATA).date().isoformat() for stamp in candidate.timestamps[1:]}),
                 "regime": "rising-price-proxy" if test[-1].close >= test[0].close else "falling-price-proxy",
                 "candidate": {"metrics": candidate.metrics.to_dict()},
                 "validation": validation_result.metrics.to_dict(),
@@ -389,4 +410,4 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
         ],
     }
     save_json(destination, report)
-    return read_json(destination)
+    return _session_audit(read_json(destination), bars, output)

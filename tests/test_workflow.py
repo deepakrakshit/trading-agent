@@ -57,6 +57,8 @@ def test_train_resume_evaluate_baselines_and_fail_closed_promotion(tmp_path):
     assert evaluation["promotion"]["active_policy_id"] is None
     assert len(evaluation["walk_forward"]) >= 3
     assert evaluation["provenance"] == ["SYNTHETIC"]
+    assert evaluation["session_count_audit"]["counts_match"]
+    assert evaluation["walk_forward_summary"]["metrics"]["sessions"] == len(set(label for row in evaluation["walk_forward"] for label in row["session_ids"]))
     assert evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite") == evaluation
     with pytest.raises(ValueError, match="immutable"):
         train_experiment(data, output, config, resume=True)
