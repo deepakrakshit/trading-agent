@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Mapping
 from zoneinfo import ZoneInfo
@@ -29,6 +29,14 @@ class RiskLimits:
     permitted_symbols: frozenset[str] | set[str] | tuple[str, ...] = frozenset()
     require_positive_equity: bool = True
     session_timezone: str = "Asia/Kolkata"
+    market_open: time | None = None
+    market_close: time | None = None
+    trading_weekdays: frozenset[int] = frozenset(range(5))
+    closed_dates: frozenset[date] = frozenset()
+    max_order_quantity: int | None = None
+    max_order_notional: Decimal | str | float | None = None
+    min_order_interval: timedelta = timedelta(0)
+    max_orders_per_session: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.version, str) or not self.version.strip():
@@ -42,6 +50,28 @@ class RiskLimits:
             raise ValueError("stale_after must be non-negative")
         object.__setattr__(self, "version", self.version.strip())
         object.__setattr__(self, "permitted_symbols", frozenset(self.permitted_symbols))
+        object.__setattr__(self, "trading_weekdays", frozenset(self.trading_weekdays))
+        object.__setattr__(self, "closed_dates", frozenset(self.closed_dates))
+        if (self.market_open is None) != (self.market_close is None):
+            raise ValueError("market_open and market_close must be configured together")
+        if self.market_open is not None:
+            if self.market_open.tzinfo or self.market_close.tzinfo:
+                raise ValueError("market hours are local wall times without timezone offsets")
+            if self.market_open >= self.market_close:
+                raise ValueError("market_open must be earlier than market_close")
+        if not self.trading_weekdays or not self.trading_weekdays <= set(range(7)):
+            raise ValueError("trading_weekdays must contain weekday numbers in [0, 6]")
+        for name in ("max_order_quantity", "max_orders_per_session"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+                raise ValueError(f"{name} must be a positive integer")
+        if self.max_order_notional is not None:
+            amount = _decimal(self.max_order_notional, "max_order_notional")
+            if amount <= 0:
+                raise ValueError("max_order_notional must be positive")
+            object.__setattr__(self, "max_order_notional", amount)
+        if self.min_order_interval < timedelta(0):
+            raise ValueError("min_order_interval must be non-negative")
         ZoneInfo(self.session_timezone)
 
 
@@ -105,6 +135,9 @@ class RiskSupervisor:
         self._loss_session: str | None = None
         self._daily_locked = False
         self._drawdown_locked = False
+        self._last_execution: datetime | None = None
+        self._execution_session: str | None = None
+        self._session_executions = 0
 
     @property
     def kill_switch_active(self) -> bool:
@@ -161,6 +194,8 @@ class RiskSupervisor:
 
         if self._kill_switch:
             reasons.append(f"kill switch active: {self._kill_reason}")
+        if not self.market_is_open(context.timestamp):
+            reasons.append("market session is closed")
         if context.cash < 0:
             reasons.append("cash invariant violated")
         if any(
@@ -231,6 +266,20 @@ class RiskSupervisor:
         current = context.positions.get(symbol, 0)
         if side.upper() == "SELL" and quantity > current:
             return RiskDecision(False, {}, ("sell quantity exceeds holding",), self.limits.version, self._kill_switch)
+        if self.limits.max_order_quantity is not None and quantity > self.limits.max_order_quantity:
+            return self._rejected("maximum order quantity exceeded")
+        if (
+            self._last_execution is not None
+            and context.timestamp - self._last_execution < self.limits.min_order_interval
+        ):
+            return self._rejected("minimum order interval not reached")
+        session = self.session_id(context.timestamp)
+        if (
+            self.limits.max_orders_per_session is not None
+            and session == self._execution_session
+            and self._session_executions >= self.limits.max_orders_per_session
+        ):
+            return self._rejected("maximum session order count exceeded")
         target_quantities = dict(context.positions)
         target_quantities[symbol] = current + (quantity if side.upper() == "BUY" else -quantity)
         weights: dict[str, Decimal] = {}
@@ -246,7 +295,47 @@ class RiskSupervisor:
             )
             if held_symbol == symbol and side.upper() == "BUY" and mark * quantity > context.cash:
                 return RiskDecision(False, {}, ("insufficient cash",), self.limits.version, self._kill_switch)
+            if (
+                held_symbol == symbol
+                and self.limits.max_order_notional is not None
+                and mark * quantity > self.limits.max_order_notional
+            ):
+                return self._rejected("maximum order notional exceeded")
         return self.evaluate(weights, context)
+
+    def session_id(self, timestamp: datetime) -> str:
+        """Return the configured exchange-local session date."""
+
+        return timestamp.astimezone(ZoneInfo(self.limits.session_timezone)).date().isoformat()
+
+    def market_is_open(self, timestamp: datetime) -> bool:
+        """Check the independent configured schedule; no price data is used.
+
+        Without market hours the supervisor permits an all-hours offline
+        research session.  Configured sessions are half-open [open, close),
+        with explicit weekdays and caller-supplied holiday dates.
+        """
+
+        if self.limits.market_open is None:
+            return True
+        local = timestamp.astimezone(ZoneInfo(self.limits.session_timezone))
+        return (
+            local.weekday() in self.limits.trading_weekdays
+            and local.date() not in self.limits.closed_dates
+            and self.limits.market_open <= local.time() < self.limits.market_close
+        )
+
+    def record_execution(self, timestamp: datetime) -> None:
+        """Count a committed paper fill, rather than rejected policy proposals."""
+
+        session = self.session_id(timestamp)
+        if session != self._execution_session:
+            self._execution_session, self._session_executions = session, 0
+        self._last_execution = timestamp
+        self._session_executions += 1
+
+    def _rejected(self, reason: str) -> RiskDecision:
+        return RiskDecision(False, {}, (reason,), self.limits.version, self._kill_switch)
 
     def export_state(self) -> dict[str, object]:
         """Return loss and kill-switch latches for restart-safe persistence."""
@@ -258,6 +347,9 @@ class RiskSupervisor:
             "loss_session": self._loss_session,
             "daily_locked": self._daily_locked,
             "drawdown_locked": self._drawdown_locked,
+            "last_execution": self._last_execution.isoformat() if self._last_execution else None,
+            "execution_session": self._execution_session,
+            "session_executions": self._session_executions,
         }
 
     def restore_state(self, state: Mapping[str, object]) -> None:
@@ -270,3 +362,7 @@ class RiskSupervisor:
         self._loss_session = state.get("loss_session")  # type: ignore[assignment]
         self._daily_locked = bool(state.get("daily_locked", False))
         self._drawdown_locked = bool(state.get("drawdown_locked", False))
+        timestamp = state.get("last_execution")
+        self._last_execution = datetime.fromisoformat(str(timestamp)) if timestamp else None
+        self._execution_session = state.get("execution_session")  # type: ignore[assignment]
+        self._session_executions = int(state.get("session_executions", 0))

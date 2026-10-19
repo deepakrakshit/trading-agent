@@ -16,6 +16,7 @@ from trading_agent.storage import PersistenceError, SQLiteRepository
 NOW = datetime(2026, 1, 5, 4, 0, tzinfo=timezone.utc)
 NEXT = NOW + timedelta(minutes=5)
 BAR = MarketBar("ABC", NEXT, 100, 110, 99, 110, 100)
+PREVIOUS_BAR = MarketBar("ABC", NOW, 100, 100, 100, 100, 100)
 ORDER = OrderRequest("buy", "ABC", "BUY", 2, NOW)
 
 
@@ -53,6 +54,7 @@ class PersistenceTests(unittest.TestCase):
             path = Path(directory) / "paper.sqlite3"
             with SQLiteRepository(path) as repo:
                 broker = PaperBroker(PortfolioLedger(1000), repository=repo)
+                broker.observe_bar(PREVIOUS_BAR)
                 broker.submit_order(ORDER)
             with SQLiteRepository(path) as repo:
                 ledger = PortfolioLedger(9999)
@@ -78,6 +80,7 @@ class PersistenceTests(unittest.TestCase):
         with SQLiteRepository() as repo:
             ledger = PortfolioLedger(1000)
             broker = PaperBroker(ledger, repository=repo)
+            broker.observe_bar(PREVIOUS_BAR)
             broker.submit_order(ORDER)
             before = ledger.export_state()
             with patch.object(repo, "record_snapshot", side_effect=RuntimeError("disk failure")):
@@ -94,6 +97,7 @@ class PersistenceTests(unittest.TestCase):
     def test_fill_records_reject_duplicate_conflicts_and_restore_kill_latch(self) -> None:
         with SQLiteRepository() as repo:
             broker = PaperBroker(PortfolioLedger(1000), repository=repo)
+            broker.observe_bar(PREVIOUS_BAR)
             broker.submit_order(ORDER)
             fill = broker.process_bar(BAR)[0].fill
             values = dict(fill_id=fill.fill_id, client_order_id=fill.client_order_id, symbol=fill.symbol, side=fill.side, quantity=fill.quantity, occurred_at=fill.occurred_at, payload=fill.to_mapping())

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 import json
-from typing import Any, Mapping
-from zoneinfo import ZoneInfo
+from typing import Any, Iterator, Mapping
 
 from ..data import MarketBar
 from ..data.bars import decimal_value, utc_timestamp
@@ -28,14 +28,66 @@ class OrderStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class PaperOpenEvent:
+    """Information observable at an eligible paper execution event.
+
+    There is deliberately no high, low, close or completed-candle volume.
+    ``available_volume`` is optional explicit *event-time* liquidity.  When it
+    is absent, the broker conservatively uses the preceding observed candle's
+    volume as a versioned proxy, never the arriving candle's future volume.
+    """
+
+    symbol: str
+    timestamp: datetime
+    price: Decimal | str | float
+    available_volume: Decimal | str | float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.symbol, str) or not self.symbol.strip():
+            raise ValueError("open-event symbol must be non-empty")
+        price = decimal_value(self.price, "open-event price")
+        if price <= 0:
+            raise ValueError("open-event price must be positive")
+        object.__setattr__(self, "symbol", self.symbol.strip())
+        object.__setattr__(self, "timestamp", utc_timestamp(self.timestamp))
+        object.__setattr__(self, "price", price)
+        if self.available_volume is not None:
+            volume = decimal_value(self.available_volume, "event-time available volume")
+            if volume < 0:
+                raise ValueError("event-time available volume must be non-negative")
+            object.__setattr__(self, "available_volume", volume)
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Return the narrow event in a stable, JSON-friendly form."""
+
+        return {
+            "symbol": self.symbol, "timestamp": self.timestamp.isoformat(),
+            "price": str(self.price),
+            "available_volume": str(self.available_volume) if self.available_volume is not None else None,
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "PaperOpenEvent":
+        """Restore an event without broadening its available information."""
+
+        return cls(**{**payload, "timestamp": datetime.fromisoformat(payload["timestamp"])})
+
+
+@dataclass(frozen=True, slots=True)
 class OrderRequest:
-    """A whole-share order whose decision used data through ``submitted_at``."""
+    """A paper intent decided at ``submitted_at`` and sized at ``sized_at``.
+
+    A fixed-quantity request is sized at submission.  A precommitted target
+    can instead be sized at its eligible open; that later timestamp is logged
+    explicitly rather than implying its share quantity was known beforehand.
+    """
 
     client_order_id: str
     symbol: str
     side: str
     quantity: int
     submitted_at: datetime
+    sized_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.client_order_id, str) or not self.client_order_id.strip():
@@ -48,17 +100,28 @@ class OrderRequest:
         object.__setattr__(self, "symbol", self.symbol.strip())
         object.__setattr__(self, "client_order_id", self.client_order_id.strip())
         object.__setattr__(self, "submitted_at", utc_timestamp(self.submitted_at))
+        sized_at = utc_timestamp(self.sized_at or self.submitted_at)
+        if sized_at < self.submitted_at:
+            raise ValueError("sizing cannot precede the decision/submission timestamp")
+        object.__setattr__(self, "sized_at", sized_at)
 
     def to_mapping(self) -> dict[str, Any]:
         """Return a canonical request for idempotency checks and replay."""
 
-        return {**asdict(self), "submitted_at": self.submitted_at.isoformat()}
+        return {
+            **asdict(self), "submitted_at": self.submitted_at.isoformat(),
+            "sized_at": self.sized_at.isoformat(),
+        }
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "OrderRequest":
         """Restore and validate a persisted order request."""
 
-        return cls(**{**payload, "submitted_at": datetime.fromisoformat(payload["submitted_at"])})
+        return cls(**{
+            **payload,
+            "submitted_at": datetime.fromisoformat(payload["submitted_at"]),
+            "sized_at": datetime.fromisoformat(payload["sized_at"]) if payload.get("sized_at") else None,
+        })
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +170,9 @@ class PaperBroker:
     account and restores its ledger, pending requests, receipts and risk latches.
     """
 
-    _STATE_KEY = "paper_broker_v1"
+    STATE_KEY = "paper_broker_v1"
+    EXECUTION_VERSION = "causal-open-v2"
+    _STATE_KEY = STATE_KEY
 
     def __init__(
         self,
@@ -128,6 +193,7 @@ class PaperBroker:
         self._requests: dict[str, OrderRequest] = {}
         self._receipts: dict[str, ExecutionReceipt] = {}
         self._last_bars: dict[str, MarketBar] = {}
+        self._last_opens: dict[str, PaperOpenEvent] = {}
         self._sequence = 0
         self._session: str | None = None
         self._session_start_equity = self.ledger.snapshot().equity
@@ -139,6 +205,98 @@ class PaperBroker:
                 self._restore(state)
             else:
                 self.checkpoint()
+
+    @property
+    def revision(self) -> int:
+        """The committed broker checkpoint revision used by an enclosing env."""
+
+        return self._sequence
+
+    @property
+    def session_start_equity(self) -> Decimal:
+        """The broker's actual exchange-session opening equity baseline."""
+
+        return self._session_start_equity
+
+    @contextmanager
+    def atomic(self) -> Iterator[None]:
+        """Roll back broker memory and SQLite together, including outer work.
+
+        An environment can include transitions and its cursor checkpoint in
+        this boundary.  Nested broker operations use SQLite savepoints; their
+        successful in-memory changes are still restored if the outer step fails.
+        """
+
+        before = self._state()
+        try:
+            with self.repository.transaction() if self.repository else nullcontext():
+                yield
+        except BaseException:
+            self._restore(before)
+            raise
+
+    def export_state(self) -> dict[str, Any]:
+        """Return a detached, validated replay/checkpoint view of broker state."""
+
+        return deepcopy(self._state())
+
+    def plan_target_order(
+        self,
+        client_order_id: str,
+        target_weight: Decimal | str | float,
+        *,
+        decision_at: datetime,
+        event: PaperOpenEvent,
+    ) -> OrderRequest | None:
+        """Size a precommitted target using only an eligible open event.
+
+        The target is chosen at ``decision_at``; whole-share sizing is deferred
+        until the eligible price is known.  The ledger and versioned cost model
+        provide all sizing inputs.  This is planning only, and never moves cash.
+        """
+
+        if event.timestamp <= utc_timestamp(decision_at):
+            raise ValueError("a target requires a strictly later eligible open")
+        weight = decimal_value(target_weight, "target_weight")
+        if not 0 <= weight <= 1:
+            raise ValueError("target_weight must lie in [0, 1]")
+        candidate = PortfolioLedger.from_state(self.ledger.export_state())
+        candidate.mark_to_market({event.symbol: event.price})
+        equity = candidate.snapshot().equity
+        current = candidate.position_quantity(event.symbol)
+        desired = candidate.target_quantity(event.symbol, weight, event.price)
+        if desired == current:
+            return None
+        side = "BUY" if desired > current else "SELL"
+        quantity = abs(desired - current)
+        if side == "BUY":
+            # Find a cost-aware affordable target.  Quoting does not charge a
+            # fee; only applying the eventual LedgerFill does that once.
+            low, high = 0, quantity
+            while low < high:
+                amount = (low + high + 1) // 2
+                quote = self.cost_model.estimate(side, amount, event.price)
+                post_equity = equity - quote.total_cost
+                fits = (
+                    -quote.cash_effect <= candidate.cash
+                    and post_equity > 0
+                    and Decimal(current + amount) * event.price <= weight * post_equity
+                )
+                if fits:
+                    low = amount
+                else:
+                    high = amount - 1
+            quantity = low
+        else:
+            # Sale fees can make the retained weight larger than requested.
+            while quantity < current:
+                quote = self.cost_model.estimate(side, quantity, event.price)
+                if Decimal(current - quantity) * event.price <= weight * (equity - quote.total_cost):
+                    break
+                quantity += 1
+        if not quantity:
+            return None
+        return OrderRequest(client_order_id, event.symbol, side, quantity, decision_at, sized_at=event.timestamp)
 
     def submit_order(
         self,
@@ -195,7 +353,8 @@ class PaperBroker:
                         payload=order.to_mapping(),
                     )
                     self._record_event(
-                        "ORDER", order.client_order_id, receipt.to_mapping(), order.submitted_at
+                        "ORDER", order.client_order_id,
+                        {**receipt.to_mapping(), "request": order.to_mapping()}, order.sized_at,
                     )
                 self.checkpoint()
         except BaseException:
@@ -206,117 +365,164 @@ class PaperBroker:
     def process_bar(
         self, bar: MarketBar, *, as_of: datetime | None = None
     ) -> tuple[ExecutionReceipt, ...]:
-        """Fill queued orders at a strictly later bar's open, then mark its close.
+        """Execute a narrow next-open event, then observe the completed candle.
 
-        ``as_of`` is the paper replay clock, defaulting to the bar timestamp.
-        Supplying a later clock makes stale-feed lockout reproducible offline.
-        Duplicate bars are no-ops, conflicting corrections/out-of-order bars
-        are errors, and a persistence failure restores all in-memory state.
+        Open execution sees only ``symbol/timestamp/open``.  The arriving
+        candle's high, low, close and volume become available only afterwards.
+        Prime the broker with :meth:`observe_bar` for historical participation,
+        or provide explicit eligible liquidity through :meth:`process_open`.
         """
 
-        clock = utc_timestamp(as_of or bar.timestamp)
         previous = self._last_bars.get(bar.symbol)
         if previous is not None and bar.timestamp <= previous.timestamp:
             if bar == previous:
                 return ()
             raise ValueError("out-of-order or conflicting duplicate execution bar")
-        if bar.timestamp > clock:
+        with self.atomic():
+            results = self.process_open(
+                PaperOpenEvent(bar.symbol, bar.timestamp, bar.open), as_of=as_of
+            )
+            self.observe_bar(bar, as_of=as_of)
+        return results
+
+    def process_open(
+        self, event: PaperOpenEvent, *, as_of: datetime | None = None
+    ) -> tuple[ExecutionReceipt, ...]:
+        """Fill queued paper orders with event-time information only.
+
+        Participation defaults to the *previously observed* candle's volume.
+        With neither that history nor explicit event liquidity, fills fail
+        closed.  Post-fill safety uses the actual candidate account context.
+        """
+
+        clock = utc_timestamp(as_of or event.timestamp)
+        previous_open = self._last_opens.get(event.symbol)
+        if previous_open is not None and event.timestamp <= previous_open.timestamp:
+            if event == previous_open:
+                return ()
+            raise ValueError("out-of-order or conflicting duplicate open event")
+        prior_bar = self._last_bars.get(event.symbol)
+        if prior_bar is not None and event.timestamp <= prior_bar.timestamp:
+            raise ValueError("open event must follow the last completed candle")
+        if event.timestamp > clock:
             raise ValueError("cannot execute on a future/unavailable bar")
-        before = self._state()
+        observed_volume = event.available_volume
+        if observed_volume is None and prior_bar is not None:
+            observed_volume = prior_bar.volume
+        available = int(
+            ((observed_volume or Decimal("0")) * self.participation_limit)
+            .to_integral_value(rounding=ROUND_FLOOR)
+        )
         results: list[ExecutionReceipt] = []
-        try:
-            with self.repository.transaction() if self.repository else nullcontext():
-                session = bar.timestamp.astimezone(
-                    ZoneInfo(self.risk_supervisor.limits.session_timezone)
-                ).date().isoformat()
-                if session != self._session:
-                    self._session = session
-                    self._session_start_equity = self.ledger.snapshot().equity
-                for order in self.pending_orders():
-                    if order.symbol != bar.symbol or bar.timestamp <= order.submitted_at:
-                        continue
-                    candidate = PortfolioLedger.from_state(self.ledger.export_state())
-                    candidate.mark_to_market({bar.symbol: bar.open}, timestamp=bar.timestamp)
-                    context = self._risk_context(candidate, bar, clock)
-                    decision = self.risk_supervisor.check_order(
-                        order.symbol, order.side, order.quantity, context=context
-                    )
-                    reason = "" if decision.approved else decision.reason
-                    available = int(
-                        (bar.volume * self.participation_limit).to_integral_value(rounding=ROUND_FLOOR)
-                    )
-                    if not reason and order.quantity > available:
-                        reason = "insufficient bar liquidity for a full fill"
-                    fill = None
-                    if not reason:
-                        try:
-                            cost = self.cost_model.estimate(order.side, order.quantity, bar.open)
-                            fill = LedgerFill(
-                                fill_id=f"{order.client_order_id}:fill",
-                                client_order_id=order.client_order_id,
-                                symbol=order.symbol,
-                                side=normalise_side(order.side),
-                                quantity=order.quantity,
-                                occurred_at=bar.timestamp,
-                                cost=cost,
-                            )
-                            candidate.apply_fill(fill)
-                            # Fees and adverse prices reduce equity.  Recheck
-                            # the resulting weights, not merely pre-cost size.
-                            decision = self.risk_supervisor.evaluate(
-                                self._weights(candidate), context
-                            )
-                            if not decision.approved:
-                                reason, fill = decision.reason, None
-                        except (ValueError, ArithmeticError) as exc:
-                            reason, fill = str(exc), None
-                    receipt = ExecutionReceipt(
-                        order.client_order_id,
-                        OrderStatus.REJECTED if reason else OrderStatus.FILLED,
-                        reason,
-                        fill,
-                    )
-                    self._receipts[order.client_order_id] = receipt
-                    if fill is not None:
-                        self.ledger.restore_state(candidate.export_state())
-                    if self.repository:
-                        self.repository.update_order_status(order.client_order_id, receipt.status.value)
-                        if fill:
-                            self.repository.record_fill(
-                                fill_id=fill.fill_id,
-                                client_order_id=fill.client_order_id,
-                                symbol=fill.symbol,
-                                side=fill.side,
-                                quantity=fill.quantity,
-                                occurred_at=fill.occurred_at,
-                                payload=fill.to_mapping(),
-                            )
-                        self._record_event(
-                            "FILL" if fill else "REJECTION",
-                            order.client_order_id,
-                            receipt.to_mapping(),
-                            bar.timestamp,
-                        )
-                        self._record_event("RISK", order.client_order_id, asdict(decision), clock)
-                    results.append(receipt)
-                self.ledger.mark_to_market({bar.symbol: bar.close}, timestamp=bar.timestamp)
-                self._last_bars[bar.symbol] = bar
-                closing_risk = self.risk_supervisor.evaluate(
-                    self._weights(self.ledger), self._risk_context(self.ledger, bar, clock)
+        with self.atomic():
+            self._begin_session(event.timestamp)
+            self.ledger.mark_to_market({event.symbol: event.price}, timestamp=event.timestamp)
+            for order in self.pending_orders():
+                if (
+                    order.symbol != event.symbol or event.timestamp <= order.submitted_at
+                    or event.timestamp < order.sized_at
+                ):
+                    continue
+                candidate = PortfolioLedger.from_state(self.ledger.export_state())
+                context = self._risk_context(candidate, event, clock)
+                decision = self.risk_supervisor.check_order(
+                    order.symbol, order.side, order.quantity, context=context
                 )
+                reason = "" if decision.approved else decision.reason
+                if not reason and order.quantity > available:
+                    reason = (
+                        "missing previously observed/event liquidity"
+                        if observed_volume is None
+                        else "insufficient observed liquidity for a full fill"
+                    )
+                fill = None
+                if not reason:
+                    before_projection = self.risk_supervisor.export_state()
+                    try:
+                        cost = self.cost_model.estimate(order.side, order.quantity, event.price)
+                        maximum = self.risk_supervisor.limits.max_order_notional
+                        if maximum is not None and cost.execution_notional > maximum:
+                            raise ValueError("maximum execution order notional exceeded")
+                        fill = LedgerFill(
+                            f"{order.client_order_id}:fill", order.client_order_id,
+                            order.symbol, normalise_side(order.side), order.quantity,
+                            event.timestamp, cost,
+                        )
+                        candidate.apply_fill(fill)
+                        decision = self.risk_supervisor.evaluate(
+                            self._weights(candidate), self._risk_context(candidate, event, clock)
+                        )
+                        if not decision.approved:
+                            reason, fill = decision.reason, None
+                    except (ValueError, ArithmeticError) as exc:
+                        reason, fill = str(exc), None
+                    if fill is None:
+                        # A rejected hypothetical fee quote is not an actual
+                        # account loss.  Preserve any already-observed latches.
+                        self.risk_supervisor.restore_state(before_projection)
+                receipt = ExecutionReceipt(
+                    order.client_order_id,
+                    OrderStatus.REJECTED if reason else OrderStatus.FILLED,
+                    reason, fill,
+                )
+                self._receipts[order.client_order_id] = receipt
+                if fill:
+                    self.ledger.restore_state(candidate.export_state())
+                    self.risk_supervisor.record_execution(event.timestamp)
                 if self.repository:
-                    self.repository.record_snapshot(
-                        self.ledger.snapshot().to_mapping(), occurred_at=bar.timestamp
-                    )
+                    self.repository.update_order_status(order.client_order_id, receipt.status.value)
+                    if fill:
+                        self.repository.record_fill(
+                            fill_id=fill.fill_id, client_order_id=fill.client_order_id,
+                            symbol=fill.symbol, side=fill.side, quantity=fill.quantity,
+                            occurred_at=fill.occurred_at, payload=fill.to_mapping(),
+                        )
                     self._record_event(
-                        "MARKET_RISK", f"{bar.symbol}:{bar.timestamp.isoformat()}",
-                        asdict(closing_risk), clock,
+                        "FILL" if fill else "REJECTION", order.client_order_id,
+                        receipt.to_mapping(), event.timestamp,
                     )
-                self.checkpoint()
-        except BaseException:
-            self._restore(before)
-            raise
+                    self._record_event("RISK", order.client_order_id, asdict(decision), clock)
+                results.append(receipt)
+            self._last_opens[event.symbol] = event
+            self.risk_supervisor.evaluate(
+                self._weights(self.ledger), self._risk_context(self.ledger, event, clock)
+            )
+            self.checkpoint()
         return tuple(results)
+
+    def observe_bar(self, bar: MarketBar, *, as_of: datetime | None = None) -> None:
+        """Observe a completed candle without retroactively placing any fill."""
+
+        clock = utc_timestamp(as_of or bar.timestamp)
+        previous = self._last_bars.get(bar.symbol)
+        if previous is not None and bar.timestamp <= previous.timestamp:
+            if bar == previous:
+                return
+            raise ValueError("out-of-order or conflicting duplicate execution bar")
+        if bar.timestamp > clock:
+            raise ValueError("cannot observe a future/unavailable bar")
+        with self.atomic():
+            self._begin_session(bar.timestamp)
+            self.ledger.mark_to_market({bar.symbol: bar.close}, timestamp=bar.timestamp)
+            self._last_bars[bar.symbol] = bar
+            closing_risk = self.risk_supervisor.evaluate(
+                self._weights(self.ledger), self._risk_context(self.ledger, bar, clock)
+            )
+            if self.repository:
+                self.repository.record_snapshot(
+                    self.ledger.snapshot().to_mapping(), occurred_at=bar.timestamp
+                )
+                self._record_event(
+                    "MARKET_RISK", f"{bar.symbol}:{bar.timestamp.isoformat()}",
+                    asdict(closing_risk), clock,
+                )
+            self.checkpoint()
+
+    def _begin_session(self, timestamp: datetime) -> None:
+        session = self.risk_supervisor.session_id(timestamp)
+        if session != self._session:
+            self._session = session
+            self._session_start_equity = self.ledger.snapshot().equity
 
     def cancel_pending(
         self, reason: str = "cancelled by paper broker"
@@ -383,7 +589,9 @@ class PaperBroker:
                 aggregate_id=order_id, occurred_at=timestamp, idempotency_key=order_id,
             )
 
-    def _risk_context(self, ledger: PortfolioLedger, bar: MarketBar, clock: datetime) -> RiskContext:
+    def _risk_context(
+        self, ledger: PortfolioLedger, bar: MarketBar | PaperOpenEvent, clock: datetime
+    ) -> RiskContext:
         snapshot = ledger.snapshot()
         return RiskContext(
             timestamp=clock,
@@ -414,6 +622,7 @@ class PaperBroker:
             return str(value)
 
         values = {
+            "execution_version": self.EXECUTION_VERSION,
             "cost_model": asdict(self.cost_model),
             "risk_limits": asdict(self.risk_supervisor.limits),
             "participation_limit": str(self.participation_limit),
@@ -428,6 +637,7 @@ class PaperBroker:
             "requests": [order.to_mapping() for order in self._requests.values()],
             "receipts": {key: receipt.to_mapping() for key, receipt in self._receipts.items()},
             "last_bars": {symbol: bar.to_mapping() for symbol, bar in self._last_bars.items()},
+            "last_opens": {symbol: event.to_mapping() for symbol, event in self._last_opens.items()},
             "risk": self.risk_supervisor.export_state(),
             "session": self._session,
             "session_start_equity": str(self._session_start_equity),
@@ -443,6 +653,9 @@ class PaperBroker:
         }
         self._last_bars = {
             symbol: MarketBar.from_mapping(row) for symbol, row in state["last_bars"].items()
+        }
+        self._last_opens = {
+            symbol: PaperOpenEvent.from_mapping(row) for symbol, row in state["last_opens"].items()
         }
         self.risk_supervisor.restore_state(state["risk"])
         self._session = state["session"]

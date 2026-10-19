@@ -327,6 +327,12 @@ class SQLiteRepository:
         ).fetchone()
         return dict(row) if row else None
 
+    def transitions(self) -> tuple[dict[str, Any], ...]:
+        """Read durable replay transitions in original commit order."""
+
+        rows = self.connection.execute("SELECT * FROM transitions ORDER BY rowid").fetchall()
+        return tuple(dict(row) for row in rows)
+
     def events(self, *, event_type: str | None = None) -> tuple[dict[str, Any], ...]:
         """Return event rows in append order."""
 
