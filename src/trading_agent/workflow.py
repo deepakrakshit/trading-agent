@@ -314,9 +314,19 @@ def _session_audit(report: dict, bars, output: Path) -> dict:
         for bar in bars[fold["test_start"] + 1:fold["test_end"]]
     }
     recorded = report["walk_forward_summary"]["metrics"]["sessions"]
+    by_seed: dict[str, list[float]] = {}
+    for row in report["walk_forward"]:
+        by_seed.setdefault(str(row["seed"]), []).append(row["candidate"]["metrics"]["net_return"])
+    compounded = {seed: math.prod(1 + value for value in values) - 1 for seed, values in by_seed.items()}
+    seed_returns = list(compounded.values())
     audit = {
         "unique_exchange_dates": sorted(dates), "unique_session_count": len(dates),
         "original_reported_count": recorded, "counts_match": len(dates) == recorded,
+        "per_seed_compounded_net_returns": compounded,
+        "median_seed_net_return": statistics.median(seed_returns),
+        "between_seed_stdev": statistics.stdev(seed_returns) if len(seed_returns) > 1 else 0.0,
+        "worst_seed_net_return": min(seed_returns), "best_seed_net_return": max(seed_returns),
+        "dispersion_note": "Algorithmic seed variation, not a confidence interval or extra independent market sessions.",
         "note": "Disjoint intraday windows may share a date. Existing holdout scores and immutable promotion receipts are not rerun/rewritten.",
     }
     save_json(output / "evaluation_session_audit.json", audit)

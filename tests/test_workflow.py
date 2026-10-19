@@ -58,6 +58,8 @@ def test_train_resume_evaluate_baselines_and_fail_closed_promotion(tmp_path):
     assert len(evaluation["walk_forward"]) >= 3
     assert evaluation["provenance"] == ["SYNTHETIC"]
     assert evaluation["session_count_audit"]["counts_match"]
+    assert set(evaluation["session_count_audit"]["per_seed_compounded_net_returns"]) == {"0", "1", "2"}
+    assert evaluation["session_count_audit"]["between_seed_stdev"] >= 0
     assert evaluation["walk_forward_summary"]["metrics"]["sessions"] == len(set(label for row in evaluation["walk_forward"] for label in row["session_ids"]))
     assert evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite") == evaluation
     with pytest.raises(ValueError, match="immutable"):

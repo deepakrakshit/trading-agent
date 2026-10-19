@@ -54,7 +54,7 @@ The project will keep CPU as the tested fallback. A CUDA result will only be rep
 
 ## Dependency decision
 
-The official PyTorch installation page (`https://docs.pytorch.org/get-started/locally/`) recommends Python 3.9–3.12 for Linux. This host has Python 3.14.4 and no alternative Python binary. The project therefore tests the newest compatible wheels in an isolated `.venv`, records the exact resolved versions in `requirements.lock`, and keeps a Dockerfile pinned to the same declared application runtime. If a future wheel drops Python 3.14 support, use the documented Docker path or install a supported 3.12 interpreter locally; do not alter system Python.
+The initial `docs.pytorch.org` page appeared stale (older selector/recommendations). The current `https://pytorch.org/get-started/locally/` page and the official wheel metadata were checked instead. PyTorch **2.10.0** has official CPython **3.14** Linux wheels, so the actual host runtime **3.14.4** was kept and tested rather than replacing system Python. CPU and optional CUDA dependency sets are pinned separately. No torchvision/torchaudio, system CUDA toolkit, global pip install, or third-party driver installer was needed.
 
 ## Baseline repository state
 
@@ -70,3 +70,43 @@ python -m trading_agent.cli doctor
 ```
 
 Do not infer GPU training from PCI detection alone.
+
+## Completed local installation and execution evidence
+
+| Environment | Actual PyTorch | Outcome |
+| --- | --- | --- |
+| `.venv` | `2.10.0+cpu` | Local install, editable package install, offline tests passed |
+| `.venv-cuda` | `2.10.0+cu128`, bundled CUDA runtime 12.8 | Local install and CPU-mode tests passed; CUDA device execution failed |
+| `.venv-repro` | `2.10.0+cpu` | Created empty, installed `requirements.lock` from scratch, installed project, all tests passed |
+
+The official CUDA wheel metadata explicitly lists Python 3.14 and pins the bundled NVIDIA libraries; its source was:
+
+`https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp314-cp314-manylinux_2_28_x86_64.whl.metadata`
+
+Actual CUDA probe from `.venv-cuda`:
+
+```text
+torch: 2.10.0+cu128
+torch.version.cuda: 12.8
+torch.cuda.is_available(): False
+torch.cuda.device_count(): 0
+nvidia-smi exit code: 9
+CPU tensor check: 14.0
+```
+
+`.venv-cuda/bin/python -m trading_agent.cli doctor --require-cuda` exited **2**. An explicit `train --device cuda` exited **1**, before creating a training run. These are expected failed GPU checks, not skipped tests or successful GPU training.
+
+Further diagnosis: **Secure Boot enabled**; the running kernel lacks the NVIDIA module; the installed older-kernel modules pin 595.71.05, while the current-kernel module requires 595.91.07 and the latest userspace candidate is 595.99.02. Two `apt-get --simulate install` transactions failed dependency resolution. No real apt install, root operation, driver/kernel change, Secure Boot change, or reboot was performed. See `docs/gpu_repair.md` for the exact evidence and user-controlled repair route.
+
+## Measured compute workload
+
+- Initial candidate: 9 observations, 5 exposure actions, **32×32 MLP (1,541 trainable parameters)**, batch 32, replay capacity 5,000, update every 4 interactions, one CPU Torch thread.
+- Actual initial run: **3,000 interactions / 735 optimizer updates / 20.6236 seconds** of measured training-loop time, using **CPU**, even though launched from the CUDA-wheel venv.
+- Separate 500-step benchmark: **3.7872 seconds**, CPU. Same workload can compare CPU/CUDA after driver repair; no GPU speedup or cross-device comparison is claimed now.
+- Second candidate: 449 imported paper transitions plus 1,000 new interactions; 347 updates total; **6.9430 seconds** for new interaction training. Import/initialization time is not included in that number.
+- Peak VRAM: **not measurable / null**. The GPU's expected 4 GiB is not a runtime-verified available-memory result.
+- Remaining disk after both primary Python environments were installed: approximately **39 GiB available** at the measured checkpoint. No memory-exhausting model was used.
+
+## Container limitation
+
+`docker --version` returned `command not found`. The maintained Dockerfile pins Python, installs system libraries and the lock, builds the package and runs `make test`, but a Docker build/run was **not executed** on this host. Fresh-venv reproducibility was executed and verified instead; it is not presented as a container test.

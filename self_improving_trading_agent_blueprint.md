@@ -597,11 +597,13 @@ Compute rules:
 - Inspect OS, Python version, `nvidia-smi`, NVIDIA driver, RAM/disk, and installed packages before environment changes. Use the official PyTorch selector to choose a compatible CUDA-enabled wheel; verify with `torch.cuda.is_available()` and `torch.cuda.get_device_name(0)`. Do not guess wheel versions or install CUDA from an unrelated third-party script.
 - Maintain an explicit CPU-only fallback. Checkpoint locally and resume after failure/restart; keep models, run metadata, and data out of source control where appropriate.
 - Colab may be used for occasional extra offline experiments, but free GPU/runtime availability is not guaranteed and a notebook disconnect makes it unsuitable as the only always-on paper-trading service. Do not require Colab to complete local development.
-- Antigravity/Gemini is the coding/research agent. The learned market policy is a separate small numerical model; do not attempt to train a general-purpose LLM on the RTX 2050.
+- **Current implementation mission:** OmniRush with GPT-6 Astra is the coding/research system. The learned market policy is a separate small numerical model; do not attempt to train a general-purpose LLM on the RTX 2050. Earlier Antigravity-specific instructions below are retained as legacy references, not instructions to change the current coding model or tooling.
 
 References: PyTorch installation and CUDA verification https://docs.pytorch.org/get-started/locally/ ; Stable-Baselines3 RL tips https://stable-baselines3.readthedocs.io/en/master/guide/rl_tips.html ; Google Colab resource limitations https://research.google.com/colaboratory/faq.html .
 
 ## 16. Agent Skills: audited, task-specific setup
+
+**Implementation note (19 October 2026):** The following Antigravity instructions describe the original tooling context. The actual OmniRush/Linux workspace has no Node/npm skills CLI; no external skill installer was run. Current instruction packs actually used are recorded in `docs/skills-audit.md`. Do not install/switch to a different external coding model for this project.
 
 Antigravity supports the open Agent Skills format. A skill is a directory containing `SKILL.md`, with optional scripts, examples and resources. For this project, use project-scoped skills in `.agents/skills/` so the setup is visible and reproducible. Antigravity CLI's global path is `~/.gemini/antigravity-cli/skills/`. The official Vercel `skills` CLI explicitly supports `antigravity-cli` as an installation target. Skills are instructions, not trusted executable programs and not a substitute for testing.
 
@@ -687,7 +689,7 @@ The coding agent must work in the user's actual local repository, inspect this e
 
 ### Stage C — Complete the existing architecture incrementally
 
-Audit and reuse working components before altering them. The starter repository currently has modules for CSV validation, causal features, accounting/costs, paper execution, deterministic risk supervision, a Gymnasium trading environment, DQN training, chronological backtesting, and tests. Verify their actual current state in the user's repository instead of assuming this snapshot matches it.
+Audit and reuse working components before altering them. **Actual workspace audit, 19 October 2026:** only this Markdown blueprint was present; no starter repository, notebook, source, tests or checkpoints existed. The former starter-snapshot assumption did not match the user's workspace. The implementation therefore created the modules incrementally, preserving this specification and keeping local Git history. Future work must reuse the now-existing implementation rather than starting over.
 
 Implement and connect the missing pieces as needed: authorised historical and read-only live data-provider interfaces; freshness/time-zone/market-calendar validation; persistent SQLite ledger and idempotent order/fill state; robust paper execution and cost attribution; experience/transition storage; reproducible trainer and checkpoint registry; walk-forward/multi-seed evaluation; candidate-versus-incumbent/shadow evaluation and gated promotion; restart/resume; structured logs and run IDs; a kill switch and useful CLI reporting. Build a dashboard only if the core end-to-end path is already correct or if the blueprint requires it; do not sacrifice correctness to visual polish. Keep the notebook as a thin optional entry point importing tested modules, if `trading.ipynb` exists.
 
@@ -721,7 +723,9 @@ Run all relevant commands from a clean project virtual environment. Fix failures
 
 At completion, provide: files changed; features working/not working; exact setup/run/test commands; test results with counts; detected GPU and actual CPU/CUDA benchmark evidence; data provider used and whether it's historical or genuinely live; training/evaluation windows and costs; model/checkpoint/run paths; known limitations; how to restart/resume; and only the precise user action still required. If live data is blocked by account access, finish offline implementation and make that limitation explicit.
 
-## 19. Copy-paste Antigravity prompt
+## 19. Legacy copy-paste Antigravity prompt
+
+The prompt below is retained for historical context. The current OmniRush mission and verified commands in `README.md` supersede its agent/tool-installation assumptions; it is not a direction to switch coding systems.
 
 Use this prompt from the **actual local repository root** after putting `self_improving_trading_agent_blueprint.md` there. The prompt deliberately lets the agent work without waiting for API keys; credentials are not needed for the offline stages.
 
@@ -768,3 +772,19 @@ At the end, update README/setup instructions and report exact commands, files ch
 - NSE data policy: https://www.nseindia.com/static/market-data/nse-data-policy
 - SEBI circular for retail algorithmic trading (for future legal review only; not authorisation for this project to execute orders): https://www.sebi.gov.in/legal/circulars/feb-2025/safer-participation-of-retail-investors-in-algorithmic-trading_91614.html
 
+## 21. Implemented offline release and verified gaps — 19 October 2026
+
+The canonical architecture above was retained: validated data → causal features → compact Double-DQN → independent risk → local paper execution → durable ledger/transitions → candidate evaluation → fail-closed registry. No real broker order capability exists.
+
+- Runtime is project-local **CPython 3.14.4** with pinned CPU/CUDA lockfiles; official PyTorch 2.10.0 wheels explicitly support this Python version. A CPU Dockerfile is maintained; Docker is not installed on the audited laptop, so its build is not claimed verified.
+- The workspace initially contained only this blueprint. Source now lives under `src/trading_agent/`, with tests, configuration, setup script, Makefile, read-only data adapters, immutable Parquet/CSV snapshots, SQLite accounts/registry and documented CLI commands.
+- Initial actions request **0%, 6.25%, 12.5%, 18.75%, 25%** exposure for one explicitly named instrument. The independent single-name/gross cap is 25%; virtual balance is ₹10,000. Costs are a versioned illustrative intraday schedule, not an exact provider bill.
+- Actual training produced `models/initial-v1/checkpoints/step-00003000.pt`. The initial 3,000-interaction run used CPU and took 20.6236 seconds of measured training-loop time. A second candidate imported 449 persisted paper transitions under a later chronological cutoff, then trained and was evaluated separately.
+- Data is **SYNTHETIC**, replayed offline. The initial shadow account finished at ₹9,502.08 after 311 simulated fills and ₹188.32 explicit fees; no profitability claim is made. Both candidates were rejected. The separate active-policy account remains ₹10,000 cash with its operator kill latch engaged.
+- The combined offline suite has **225 passing tests**, zero failed/skipped, including genuine optimization/reload, causal next-open fills, risk, accounting, provider mocks, candidate gates and restart recovery. See `docs/test_report.md` for exact checks and qualifications.
+- An audit corrected duplicate boundary-date session counting across walk-forward windows. Existing financial scores and rejected receipts were preserved; separate audit artifacts show 7 and 13 unique evaluation dates, rather than treating overlapping window-sessions/seeds as independent samples.
+- The RTX 2050 is detected on PCI, but the running kernel lacks a matching NVIDIA module. CUDA-enabled PyTorch was installed locally and still reports zero usable devices. Two simulated Ubuntu package repairs failed due incompatible versions; no privileged system change/reboot occurred. User-controlled signed driver/kernel repair is required; see `docs/gpu_repair.md`.
+- SmartAPI's official FAQ/docs returned an authorization message. Public official SDK source was inspected, and only historical-candle/quote read-only routes were implemented and mock-tested. No authenticated/live feed, current entitlement, official rate limit, free-access promise or qualifying live paper-shadow history was fabricated.
+- Remaining scope includes authorised real history/calendar/corporate actions, verified live paper/shadow operation and deployment-consistent observations, execution stress, stronger research evidence/PPO comparison, dedicated drift monitoring and a real container build. Retraining is a deliberate CLI cycle, not an untested always-on schedule.
+
+Operational evidence and precise continuation steps are in `README.md`, `docs/environment_report.md`, `docs/data_sources.md`, `docs/model_evaluation.md` and `docs/test_report.md`. Keep future results in this same blueprint filename rather than creating duplicate canonical specifications.
