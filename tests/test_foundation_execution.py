@@ -51,6 +51,7 @@ class PaperExecutionTests(unittest.TestCase):
     def test_insufficient_cash_after_charges_rejects_without_side_effects(self) -> None:
         ledger = PortfolioLedger(200)
         broker = PaperBroker(ledger, cost_model=CostModel(brokerage_rate="0.01"))
+        broker.observe_bar(bar(0))
         broker.submit_order(order())
         receipt, = broker.process_bar(bar(5))
         self.assertEqual(receipt.status, OrderStatus.REJECTED)
@@ -61,6 +62,7 @@ class PaperExecutionTests(unittest.TestCase):
     def test_pending_duplicate_targets_and_no_liquidity_do_not_create_fills(self) -> None:
         ledger = PortfolioLedger(1000)
         broker = PaperBroker(ledger, participation_limit="0.1")
+        broker.observe_bar(bar(0, volume=10))
         broker.submit_order(order())
         self.assertEqual(broker.submit_order(order("another")).status, OrderStatus.REJECTED)
         receipt, = broker.process_bar(bar(5, volume=10))
@@ -74,6 +76,7 @@ class PaperExecutionTests(unittest.TestCase):
             cost_model=CostModel(brokerage_rate="0.01"),
             risk_supervisor=RiskSupervisor(RiskLimits(max_symbol_weight="0.5")),
         )
+        broker.observe_bar(bar(0))
         broker.submit_order(order(quantity=5))
         receipt, = broker.process_bar(bar(5))
         self.assertIn("symbol cap", receipt.reason)
@@ -81,6 +84,7 @@ class PaperExecutionTests(unittest.TestCase):
 
     def test_loss_latch_is_monitored_on_bars_without_a_policy_order(self) -> None:
         broker = PaperBroker(PortfolioLedger(1000))
+        broker.observe_bar(bar(0))
         broker.submit_order(order(quantity=5))
         broker.process_bar(bar(5))
         broker.process_bar(bar(10, open_price=80, close=80))
