@@ -158,9 +158,11 @@ def dispatch(args, config):
     if args.command == "train":
         return train_experiment(args.data, args.output, config, steps=args.steps, seed=args.seed, device=resolve_device(args.device), resume=args.resume, experience_db=args.experience_db)
     if args.command == "evaluate":
-        return evaluate_experiment(args.experiment, registry_path=args.registry, device=resolve_device(args.device))
+        report = evaluate_experiment(args.experiment, registry_path=args.registry, device=resolve_device(args.device))
+        return {"report": str(Path(args.experiment) / "evaluation.json"), "test": report["test"]["metrics"], "baselines": {name: row["metrics"] for name, row in report["baselines"].items()}, "walk_forward_summary": report["walk_forward_summary"], "promotion": report["promotion"], "provenance": report["provenance"]}
     if args.command == "paper":
-        return run_paper(args.experiment, args.db, strategy=args.strategy, shadow=args.shadow, resume=args.resume, max_steps=args.max_steps, registry_path=args.registry)
+        report = run_paper(args.experiment, args.db, strategy=args.strategy, shadow=args.shadow, resume=args.resume, max_steps=args.max_steps, registry_path=args.registry)
+        return {key: value for key, value in report.items() if key != "attribution"} | {"detailed_report": str(Path(args.db).with_suffix(".report.json"))}
     if args.command == "account":
         result = inspect_account(args.db, view=args.view)
         if args.output:

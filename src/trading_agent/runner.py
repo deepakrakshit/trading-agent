@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 import json
 import os
 from pathlib import Path
@@ -145,6 +146,11 @@ def paper_report(spec: dict, bars, env) -> dict:
             trade_pnls=[pnl for row in records for pnl in row["info"]["closed_trade_pnls"]],
         ).to_dict()
     account = env.ledger.snapshot().to_mapping()
+    attribution = attribute_round_trips(records, bars)
+    if not env.shares:
+        realized = sum((Decimal(trade["net_pnl"]) for trade in attribution["closed_round_trips"]), Decimal("0"))
+        if realized != env.ledger.realized_pnl:
+            raise AssertionError("closed paper trade attribution disagrees with the ledger")
     return {
         "mode": "SHADOW_PAPER_REPLAY" if spec["shadow"] else "PAPER_REPLAY",
         "provenance": spec["provenance"], "policy_version": spec["policy_version"],
@@ -153,7 +159,8 @@ def paper_report(spec: dict, bars, env) -> dict:
         "kill_switch": env.risk_supervisor.kill_switch_active,
         "rejections": sum(len(row["info"]["rejections"]) for row in records),
         "liquidation_unfilled": env.render().get("liquidation_unfilled", False),
-        "attribution": attribute_round_trips(records, bars),
+        "closed_round_trips": len(attribution["closed_round_trips"]),
+        "attribution": attribution,
         "note": "Simulated fills only. Replay is not a genuinely streaming live trial.",
     }
 

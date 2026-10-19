@@ -64,3 +64,21 @@ def test_no_approved_policy_means_cash_not_automatic_candidate_use(experiment, t
     assert report["policy_version"] == "cash-v1"
     assert report["account"]["equity"] == "10000.00"
     assert report["metrics"]["trades"] == 0
+
+
+def test_next_candidate_can_learn_only_from_paper_experience_before_its_cutoff(experiment, tmp_path):
+    from trading_agent.workflow import read_json
+    db = tmp_path / "experience.sqlite"
+    run_paper(experiment, db, strategy="candidate", shadow=True)
+    manifest = read_json(experiment / "experiment.json")
+    config = manifest["config"]
+    original_data = experiment / manifest["dataset"]
+    with pytest.raises(ValueError, match="cutoff"):
+        train_experiment(original_data, tmp_path / "leaking-candidate", config, experience_db=db)
+    expanded = tmp_path / "expanded.parquet"
+    generate_synthetic(expanded, sessions=8)
+    candidate = train_experiment(expanded, tmp_path / "next-candidate", config, experience_db=db)
+    assert candidate["experience_transitions"] == 74
+    assert candidate["steps"] == 74 + config["training"]["steps"]
+    assert candidate["updates"] > 0
+    assert inspect_account(db)["paper_only"]
