@@ -10,7 +10,6 @@ from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 import json
 from typing import Any, Iterator, Mapping
-from zoneinfo import ZoneInfo
 
 from ..data import MarketBar
 from ..data.bars import decimal_value, utc_timestamp
@@ -76,13 +75,19 @@ class PaperOpenEvent:
 
 @dataclass(frozen=True, slots=True)
 class OrderRequest:
-    """A whole-share order whose decision used data through ``submitted_at``."""
+    """A paper intent decided at ``submitted_at`` and sized at ``sized_at``.
+
+    A fixed-quantity request is sized at submission.  A precommitted target
+    can instead be sized at its eligible open; that later timestamp is logged
+    explicitly rather than implying its share quantity was known beforehand.
+    """
 
     client_order_id: str
     symbol: str
     side: str
     quantity: int
     submitted_at: datetime
+    sized_at: datetime | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.client_order_id, str) or not self.client_order_id.strip():
@@ -95,17 +100,28 @@ class OrderRequest:
         object.__setattr__(self, "symbol", self.symbol.strip())
         object.__setattr__(self, "client_order_id", self.client_order_id.strip())
         object.__setattr__(self, "submitted_at", utc_timestamp(self.submitted_at))
+        sized_at = utc_timestamp(self.sized_at or self.submitted_at)
+        if sized_at < self.submitted_at:
+            raise ValueError("sizing cannot precede the decision/submission timestamp")
+        object.__setattr__(self, "sized_at", sized_at)
 
     def to_mapping(self) -> dict[str, Any]:
         """Return a canonical request for idempotency checks and replay."""
 
-        return {**asdict(self), "submitted_at": self.submitted_at.isoformat()}
+        return {
+            **asdict(self), "submitted_at": self.submitted_at.isoformat(),
+            "sized_at": self.sized_at.isoformat(),
+        }
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "OrderRequest":
         """Restore and validate a persisted order request."""
 
-        return cls(**{**payload, "submitted_at": datetime.fromisoformat(payload["submitted_at"])})
+        return cls(**{
+            **payload,
+            "submitted_at": datetime.fromisoformat(payload["submitted_at"]),
+            "sized_at": datetime.fromisoformat(payload["sized_at"]) if payload.get("sized_at") else None,
+        })
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,7 +296,7 @@ class PaperBroker:
                 quantity += 1
         if not quantity:
             return None
-        return OrderRequest(client_order_id, event.symbol, side, quantity, decision_at)
+        return OrderRequest(client_order_id, event.symbol, side, quantity, decision_at, sized_at=event.timestamp)
 
     def submit_order(
         self,
@@ -337,7 +353,8 @@ class PaperBroker:
                         payload=order.to_mapping(),
                     )
                     self._record_event(
-                        "ORDER", order.client_order_id, receipt.to_mapping(), order.submitted_at
+                        "ORDER", order.client_order_id,
+                        {**receipt.to_mapping(), "request": order.to_mapping()}, order.sized_at,
                     )
                 self.checkpoint()
         except BaseException:
@@ -401,7 +418,10 @@ class PaperBroker:
             self._begin_session(event.timestamp)
             self.ledger.mark_to_market({event.symbol: event.price}, timestamp=event.timestamp)
             for order in self.pending_orders():
-                if order.symbol != event.symbol or event.timestamp <= order.submitted_at:
+                if (
+                    order.symbol != event.symbol or event.timestamp <= order.submitted_at
+                    or event.timestamp < order.sized_at
+                ):
                     continue
                 candidate = PortfolioLedger.from_state(self.ledger.export_state())
                 context = self._risk_context(candidate, event, clock)
@@ -417,8 +437,12 @@ class PaperBroker:
                     )
                 fill = None
                 if not reason:
+                    before_projection = self.risk_supervisor.export_state()
                     try:
                         cost = self.cost_model.estimate(order.side, order.quantity, event.price)
+                        maximum = self.risk_supervisor.limits.max_order_notional
+                        if maximum is not None and cost.execution_notional > maximum:
+                            raise ValueError("maximum execution order notional exceeded")
                         fill = LedgerFill(
                             f"{order.client_order_id}:fill", order.client_order_id,
                             order.symbol, normalise_side(order.side), order.quantity,
@@ -432,6 +456,10 @@ class PaperBroker:
                             reason, fill = decision.reason, None
                     except (ValueError, ArithmeticError) as exc:
                         reason, fill = str(exc), None
+                    if fill is None:
+                        # A rejected hypothetical fee quote is not an actual
+                        # account loss.  Preserve any already-observed latches.
+                        self.risk_supervisor.restore_state(before_projection)
                 receipt = ExecutionReceipt(
                     order.client_order_id,
                     OrderStatus.REJECTED if reason else OrderStatus.FILLED,

@@ -65,6 +65,20 @@ def test_post_fill_loss_guard_sees_equity_after_fees_not_opening_equity():
     assert not receipt.filled
     assert "daily loss" in receipt.reason
     assert broker.ledger.cash == 10_000 and not broker.ledger.positions
+    broker.submit_order(OrderRequest("smaller", "ABC", "BUY", 1, NEXT))
+    assert broker.process_open(PaperOpenEvent("ABC", NEXT + timedelta(minutes=5), 100))[0].filled
+
+
+def test_order_notional_limit_includes_the_actual_adverse_execution_price():
+    broker = PaperBroker(
+        PortfolioLedger(1000), cost_model=CostModel(slippage_bps=100),
+        risk_supervisor=RiskSupervisor(RiskLimits(max_order_notional=200)),
+    )
+    broker.observe_bar(PREVIOUS)
+    broker.submit_order(OrderRequest("buy", "ABC", "BUY", 2, NOW))
+    receipt, = broker.process_open(PaperOpenEvent("ABC", NEXT, 100))
+    assert "execution order notional" in receipt.reason
+    assert broker.ledger.cash == 1000 and not broker.ledger.positions
 
 
 def test_enclosing_transaction_restores_successful_broker_operations_in_memory():
