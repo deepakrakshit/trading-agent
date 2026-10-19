@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass
 import importlib
 import json
 import math
+from numbers import Integral
 import os
 from pathlib import Path
 import random
@@ -59,10 +60,15 @@ class Transition:
         object.__setattr__(self, "next_observation", _observation(self.next_observation))
         if len(self.observation) != len(self.next_observation):
             raise ValueError("transition observation dimensions differ")
-        if isinstance(self.action, bool) or not isinstance(self.action, int) or self.action < 0:
+        if isinstance(self.action, bool) or not isinstance(self.action, Integral) or self.action < 0:
             raise ValueError("action must be a non-negative integer")
         if not math.isfinite(self.reward):
             raise ValueError("reward must be finite")
+        # Gym/NumPy scalar values are normalised to safe checkpoint primitives.
+        object.__setattr__(self, "action", int(self.action))
+        object.__setattr__(self, "reward", float(self.reward))
+        object.__setattr__(self, "terminated", bool(self.terminated))
+        object.__setattr__(self, "truncated", bool(self.truncated))
 
 
 class ReplayBuffer:
@@ -187,7 +193,9 @@ class DQNTrainer:
         # No dropout/noisy layers: network construction is the only torch RNG
         # consumer.  Preserve the application's global RNG while seeding it.
         with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(config.seed)
+            # Layers are initialised on CPU before moving to the chosen
+            # device, so no application CUDA generator needs to be reseeded.
+            torch.random.default_generator.manual_seed(config.seed)
             layers = []
             previous = config.observation_dim
             for size in config.hidden_sizes:

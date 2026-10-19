@@ -31,6 +31,18 @@ def test_replay_ring_and_sampler_restore_copy_inputs():
         buffer.sample(4)
 
 
+def test_numpy_gym_scalars_are_safe_checkpoint_values(tmp_path):
+    numpy = pytest.importorskip("numpy")
+    pytest.importorskip("torch")
+    trainer = DQNTrainer(config())
+    item = Transition(numpy.array([0, 1]), numpy.int64(1), numpy.float32(0.1), numpy.array([1, 1]), numpy.bool_(False), numpy.bool_(True))
+    assert type(item.action) is int and type(item.reward) is float
+    assert type(item.terminated) is bool and type(item.truncated) is bool
+    trainer.observe(item)
+    restored = DQNTrainer.load_checkpoint(trainer.save_checkpoint(tmp_path / "numpy-scalars.pt"))
+    assert restored.replay.sample(1) == (item,)
+
+
 @pytest.mark.parametrize("kwargs", [{"gamma": float("nan")}, {"batch_size": 11, "replay_capacity": 10}, {"n_actions": 0}])
 def test_invalid_config(kwargs):
     values = {"observation_dim": 2, "n_actions": 2}
@@ -97,6 +109,21 @@ def test_double_dqn_uses_online_argmax_but_target_value_and_terminal_mask():
     assert standard._targets(rewards, observations, terminals).tolist() == [5.5, 1]
 
 
+def test_time_limit_truncation_bootstraps_but_true_terminal_does_not():
+    torch = pytest.importorskip("torch")
+    settings = replace(config(), hidden_sizes=(), gamma=0.5, batch_size=1, learning_starts=1)
+    losses = []
+    for terminated, truncated, bootstrap in ((False, True, True), (False, True, False), (True, False, True)):
+        trainer = DQNTrainer(replace(settings, bootstrap_truncated=bootstrap))
+        with torch.no_grad():
+            trainer.online[0].weight.zero_()
+            trainer.online[0].bias.zero_()
+            trainer.target[0].weight.zero_()
+            trainer.target[0].bias.fill_(2)
+        losses.append(trainer.observe(Transition((0, 1), 0, 0, (0, 1), terminated, truncated)))
+    assert losses == [0.5, 0, 0]
+
+
 def test_gym_training_loop_and_truncated_budget():
     pytest.importorskip("torch")
     pytest.importorskip("gymnasium")
@@ -122,3 +149,44 @@ def test_rejects_nonfinite_transition_and_bad_checkpoint(tmp_path):
     torch.save({"format": "other", "version": 1}, path)
     with pytest.raises(ValueError, match="format"):
         DQNTrainer.load_checkpoint(path)
+
+
+def test_offline_train_restore_evaluate_and_stage_without_safety_receipts(tmp_path):
+    """The real paper components compose without any provider/network service."""
+    pytest.importorskip("torch")
+    pytest.importorskip("gymnasium")
+    from datetime import datetime, timedelta, timezone
+    from trading_agent.env import MarketBar, SimplePaperExecution, TradingEnv
+    from trading_agent.evaluation import evaluate_baselines, evaluate_policy
+    from trading_agent.registry import CandidateRegistry, EvaluationSummary, EvaluationWindow, PromotionEvidence
+
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    bars = [MarketBar(start + timedelta(days=index), 100, 102, 99, 100 + index % 2, 100) for index in range(30)]
+
+    def factory(rows):
+        return TradingEnv(rows, target_exposures=(0, 1), execution=SimplePaperExecution(0.001, 5))
+
+    trainer = DQNTrainer(replace(config(), observation_dim=9), metadata={"data_version": "SYNTHETIC-smoke", "action_schema": [0, 1], "feature_schema": "default-causal-v1", "reward": "log-equity-v1", "costs": {"fee_rate": 0.001, "slippage_bps": 5}})
+    trainer.train(factory(bars[:10]), 18)
+    checkpoint = trainer.save_checkpoint(tmp_path / "candidate.pt")
+    policy = DQNTrainer.load_checkpoint(checkpoint)
+    candidate = evaluate_policy(factory(bars[10:]), policy)
+    baselines = evaluate_baselines(lambda: factory(bars[10:]))
+    assert candidate == evaluate_policy(factory(bars[10:]), trainer)
+    bounds = ((10, 20), (20, 30))
+
+    def report(policy_id, result, policy_callable):
+        windows = tuple(EvaluationWindow(first, last, evaluate_policy(factory(bars[first:last]), policy_callable).metrics.net_return, "SYNTHETIC-development") for first, last in bounds)
+        return EvaluationSummary(policy_id, "SYNTHETIC-smoke:unseen10-30:fees0.001:slip5", result.metrics, windows, (0,))
+
+    # Empty safety receipts intentionally cannot become a promotion just
+    # because a checkpoint trains, reloads and obtains an evaluation score.
+    evidence = PromotionEvidence("integration-trial", report("candidate", candidate, policy), accounting_ok=True, data_integrity_ok=True, risk_ok=True)
+    with CandidateRegistry(tmp_path / "registry.sqlite") as registry:
+        registry.register("candidate", checkpoint, metadata=policy.metadata)
+        decision = registry.consider("candidate", evidence)
+        assert not decision.accepted
+        assert "shadow_failed" in decision.reasons and "recovery_failed" in decision.reasons
+        assert registry.active is None
+        assert registry.history()[-1]["kind"] == "rejected"
+    assert set(baselines) == {"cash", "rule", "random"}
