@@ -1,0 +1,27 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+!.env.example
+
+# Generated runtime data and model artifacts. Keep directories, not contents.
+data/raw/*
+data/processed/*
+models/*
+runs/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!models/.gitkeep
+!runs/.gitkeep
+
+# Local editor/OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
