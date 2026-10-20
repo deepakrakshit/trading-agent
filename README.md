@@ -48,9 +48,9 @@ For durable local output, bind-mount a writable `runs/` directory (the container
 make demo
 ```
 
-On a fresh checkout this creates 24 **SYNTHETIC weekday** sessions, trains 3,000 Double-DQN interaction steps into the new `models/initial-v2/` experiment, saves/reloads checkpoints, runs three-seed walk-forward evaluation and cash/rule/random baselines, and restarts a SQLite shadow paper account under `runs/demo-v2/`. On subsequent runs it resumes that v2 account and reads its pinned evaluation receipt; it does **not** retune on that holdout. Preserved v1 artifacts are historical receipts and are rejected by the current loader rather than overwritten.
+On a fresh checkout this creates 24 **SYNTHETIC weekday** sessions, trains 3,000 Double-DQN interaction steps into the new `models/initial-v3/` experiment, saves/reloads checkpoints, runs three-seed walk-forward evaluation and cash/rule/random baselines, and restarts a SQLite shadow paper account under `runs/demo-v3/`. On subsequent runs it resumes that v3 account and reads its pinned evaluation receipt; it does **not** retune on that holdout. Preserved v1/v2 artifacts are historical receipts and are rejected by the current loader rather than overwritten.
 
-The preserved historical v1 run ended at **₹9,502.08** with **311 paper fills / 29 closed inventory round trips** and **₹188.32 explicit fees**. The current v2 audit receipt ended at **₹9,698.67** with 183 fills and **₹67.88 fees** after an explicit 256-step CPU override. Both candidates were rejected; the separate active-policy fallback remains cash. These synthetic results demonstrate the software, not a profitable strategy. Details: `docs/model_evaluation.md`.
+The preserved historical v1 run ended at **₹9,502.08** with **311 paper fills / 29 closed inventory round trips** and **₹188.32 explicit fees**. The preserved pre-v4 v2 audit receipt ended at **₹9,698.67** with 183 fills and **₹67.88 fees** after an explicit 256-step CPU override. The current execution-v4-compatible v3 demo ended at **₹9,582.25** with 260 fills and **₹149.70 fees**; it was also rejected. The separate active-policy fallback remains cash. These synthetic results demonstrate the software, not a profitable strategy. Details: `docs/model_evaluation.md`.
 
 ## Individual workflow commands
 
@@ -78,8 +78,12 @@ Run from the repository root. The first `generate` command is for a fresh path: 
 # Resume with the exact stored dataset, policy hash, configuration and cursor
 .venv/bin/python -m trading_agent.cli paper --db runs/research/account.sqlite --resume
 
+# Provider-independent completed-bar paper replay; this is still not a live-feed claim
+.venv/bin/python -m trading_agent.cli paper-stream --data data/raw/synthetic.parquet --db runs/stream/account.sqlite --strategy cash --max-bars 100
+.venv/bin/python -m trading_agent.cli paper-stream --data data/raw/synthetic.parquet --db runs/stream/account.sqlite --strategy cash --resume --max-bars 100
+
 # Active policy only: without an accepted candidate, this safely uses cash-v1
-.venv/bin/python -m trading_agent.cli paper --experiment models/initial-v2 --db runs/new-active/account.sqlite --strategy active
+.venv/bin/python -m trading_agent.cli paper --experiment models/initial-v3 --db runs/new-active/account.sqlite --strategy active
 
 # Durable account and audit records
 .venv/bin/python -m trading_agent.cli account --db runs/demo/account.sqlite
@@ -173,18 +177,21 @@ Optional SmartAPI commands consume **locally exported** `SMARTAPI_API_KEY` and `
 .venv/bin/python -m trading_agent.cli quote --symbol YOUR_EQUITY_SYMBOL --instrument-token YOUR_PUBLIC_INSTRUMENT_ID --count 3
 ```
 
-Quote polling is labelled **READ_ONLY_POLL**, not verified LIVE. Stale last-trade timestamps are rejected even if a feed heartbeat is fresh. These adapters are mock-tested only; a continuously streaming live-paper runner is **not** claimed complete.
+Quote polling is labelled **READ_ONLY_POLL**, not verified LIVE. Stale last-trade timestamps are rejected even if a feed heartbeat is fresh. These adapters are mock-tested only. `paper-stream` now provides a provider-independent completed-bar replay with explicit provenance, completion/receipt clocks, bounded retries, durable cursor recovery and the canonical paper broker; it is **not** a verified live feed or live-shadow deployment.
 
 ## Files and limitations
 
 - `configs/default.json`: ₹10,000 balance; 25% single-name/gross cap; 2% daily loss lock; 10% drawdown lock; order-size/frequency guards; illustrative fee schedule.
 - `models/initial-v1/`: preserved historical v1 checkpoint/evaluation receipt; current code rejects it without migration.
-- `models/initial-v2/`: current v2 demo checkpoint, pinned snapshot manifest, compatibility contract, holdout receipt and walk-forward artifacts.
+- `models/initial-v2/`: preserved pre-v4 v2 demo checkpoint and receipts; current code intentionally rejects it rather than guessing execution compatibility.
+- `models/initial-v3/`: current execution-v4-compatible demo checkpoint, pinned snapshot manifest, compatibility contract, holdout receipt and walk-forward artifacts after `make demo`.
 - `models/paper-replay-v2/`: subsequent replay-trained candidate and later evaluation.
 - `models/registry.sqlite`: immutable registrations and rejection/promotion/rollback history.
 - `runs/demo/`: preserved historical v1 SQLite account and receipt.
-- `runs/demo-v2/`: current v2 SQLite account, detailed cost attribution, run receipt and diagnostic rule account.
+- `runs/demo-v2/`: preserved pre-v4 v2 SQLite account and historical receipt.
+- `runs/demo-v3/`: current execution-v4-compatible SQLite account, detailed cost attribution, run receipt and diagnostic rule account.
 - `runs/active/`: separate safe cash account, not an unapproved candidate.
+- `src/trading_agent/data/stream.py`, `src/trading_agent/continuous.py`: provider-independent completed-bar feed/event and durable continuous paper replay contracts.
 - `docs/environment_report.md`, `docs/skills-audit.md`, `docs/test_report.md`, `docs/model_evaluation.md`, `docs/t1_hardening.md`: measured evidence, hardening changes, and gaps.
 
 Checkpoints/data/logs and local virtual environments are ignored by Git; source/configuration/lockfiles/docs/tests are committed. No secrets or licensed datasets are committed. The main CLI uses `paper_env.PaperTradingEnv` and the canonical broker/ledger for training, evaluation and replay. `env.py` retains the small injected-execution reference environment for compatibility tests; it is not the CLI accounting engine.

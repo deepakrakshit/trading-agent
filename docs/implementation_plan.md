@@ -14,12 +14,13 @@ The canonical technical specification is `self_improving_trading_agent_blueprint
 8. A compact DQN-family policy really trains, saves, reloads, selects actions, and can be evaluated against cash, a rule baseline, and random actions on chronological splits.
 9. Candidate promotion is deterministic, logged, and reversible; a failed candidate cannot replace the incumbent.
 10. An offline end-to-end demo creates a ₹10,000 virtual account, runs paper fills, writes a report, and states the data provenance and limitations honestly.
+11. A provider-independent completed-bar paper replay can resume from a durable cursor, reject stale/out-of-order events, retry bounded provider failures, and retain a persistent kill switch without adding a real order route.
 
 ## Requirement-to-component map
 
 | Blueprint area | Implemented component | Evidence |
 | --- | --- | --- |
-| Data provider abstraction | `trading_agent.data` protocol, synthetic/CSV/Parquet providers, narrow SmartAPI historical/quote adapters | provider/validation/transport mocks; strict CSV completion and optional quote-symbol checks; no real feed claim |
+| Data provider abstraction | `trading_agent.data` protocol, synthetic/CSV/Parquet providers, `CompletedBarFeed`/`ReplayBarFeed`/`RangeProviderFeed`, narrow SmartAPI historical/quote adapters | provider/validation/transport mocks; completed-bar event identity/clock/retry tests; strict CSV completion and optional quote-symbol checks; no real feed claim |
 | Data quality/freshness | `trading_agent.data.validation` | malformed/duplicate/stale/session tests |
 | Causal features | `trading_agent.features` | no-look-ahead and split tests |
 | Portfolio math/costs | `trading_agent.portfolio` | hand-calculated ledger and fee tests |
@@ -30,7 +31,7 @@ The canonical technical specification is `self_improving_trading_agent_blueprint
 | Evaluation/baselines | `trading_agent.evaluation`, `trading_agent.workflow` | actual three-seed chronological runs, cash/rule/random baselines, session-count audit |
 | Promotion/rollback | `trading_agent.registry` | gate/rejection/rollback tests |
 | Durable records | SQLite repository plus JSON/Parquet run artifacts, `trading_agent.experience` | persistence/replay tests, SQLite integrity check, explicit provenance manifests and receipt hashes |
-| User workflow | `trading_agent.cli`, `trading_agent.runner` and `Makefile` | actual doctor, generate, train, evaluate, demo, account, kill and resume commands |
+| User workflow | `trading_agent.cli`, `trading_agent.runner`, `trading_agent.continuous` and `Makefile` | actual doctor, generate, train, evaluate, demo, account, kill, finite replay and completed-bar stream replay/resume commands |
 | Reproducibility | `.python-version`, `pyproject.toml`, CPU/CUDA locks, `Dockerfile`, `.env.example` | empty-venv install/tests passed; Docker itself unavailable |
 
 ## Explicit scope boundaries
@@ -46,14 +47,15 @@ The canonical technical specification is `self_improving_trading_agent_blueprint
 | Stage | Verified delivery status | Exit evidence |
 | --- | --- | --- |
 | A. Repository/environment audit | Complete | `docs/environment_report.md`, this checklist |
-| B. Reproducible setup | CPU/CUDA-wheel venvs and fresh CPU rebuild verified; container not run | pinned install, 249 offline tests; Docker missing |
+| B. Reproducible setup | CPU/CUDA-wheel venvs and fresh CPU rebuild verified; container not run | pinned install, 259 offline tests; Docker missing |
 | C. Data/ledger/execution foundations | Offline implementation complete | validation, cost, execution, risk and persistence tests |
 | D. RL environment/training | Actual CPU training/reload complete | two trained candidates and environment checker |
 | E. Evaluation/self-improvement | Offline candidate cycle complete; both rejected | six fold/seed fits per experiment, later-cutoff replay learning and registry receipts |
 | F. Offline end-to-end operation | Complete and restart-tested | ₹10,000 shadow account, durable fills/attribution, pinned manifests and v2 resume |
+| F.1 Provider-independent continuous paper replay | Complete offline/replay validation; no live claim | completed-bar feed/event contract, mocked/range/replay feeds, 259-test suite, cursor recovery, bounded retry, stale health and persistent kill tests |
 | G. GPU benchmark | CUDA blocked by kernel/driver; CPU measured | CUDA wheel installed, failed real availability probe, 500-step CPU benchmark |
 | H. Real data/live paper | Not verified; live service not claimed complete | user-authorised data/session/calendar and operational shadow evidence required |
 
 ## Final acceptance boundary
 
-The original ten offline acceptance criteria are exercised by the 249-test suite and actual CLI demo. The T1 RL hardening follow-up and subsequent timing/accounting/data-integrity fixes are recorded in `docs/t1_hardening.md` and `docs/test_report.md`. This is not completion of the blueprint's eventual live-market research/service phases. `docs/model_evaluation.md` records negative results, corrected independent session counts and uncertainty; `docs/test_report.md` records executed checks and genuine gaps. GPU system repair, authenticated provider access/terms and a Docker-capable environment require user-controlled setup. No paid resources, real financial actions, secrets or remote Git pushes were introduced.
+The original ten offline acceptance criteria plus the completed-bar replay criterion are exercised by the 259-test suite and actual CLI demo/stream smoke checks. The T1 RL hardening follow-up and subsequent timing/accounting/data-integrity fixes are recorded in `docs/t1_hardening.md` and `docs/test_report.md`. This is not completion of the blueprint's eventual live-market research/service phases. `docs/model_evaluation.md` records negative results, corrected independent session counts and uncertainty; `docs/test_report.md` records executed checks and genuine gaps. GPU system repair, authenticated provider access/terms and a Docker-capable environment require user-controlled setup. No paid resources, real financial actions, secrets or remote Git pushes were introduced.

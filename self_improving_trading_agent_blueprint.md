@@ -811,7 +811,7 @@ The continuation audit preserved the historical v1 checkpoints/accounts and
 committed the RL hardening plus additional accounting/data fixes at
 `2835cd2`:
 
-- The canonical execution contract is now `causal-open-v3`. A replay cannot
+- The canonical execution contract is now `causal-open-v4`. A replay cannot
   consume a next-bar close/reward before its completed availability time, and
   accepted explicit clocks cannot move backwards. Open-session validation uses
   the actual eligible open while feed freshness uses the observation clock.
@@ -823,8 +823,8 @@ committed the RL hardening plus additional accounting/data fixes at
   five-minute `BAR_START` contract. Experiment, paper, and experience receipts
   pin the snapshot-manifest digest; historical reload uses the original capture
   boundary. Consumed evaluations require a SHA-256 sidecar.
-- The default demo now uses new `models/initial-v2/` and `runs/demo-v2/` paths,
-  so preserved v1 artifacts cannot be overwritten. A fresh committed-source
+- The default demo now uses new `models/initial-v3/` and `runs/demo-v3/` paths,
+  so preserved v1/v2 artifacts cannot be overwritten. A fresh committed-source
   CPU audit (`cpu-audit-v1`) executed 64 interactions in 0.5981 seconds,
   reloaded action 4, evaluated independently, and was rejected on synthetic
   data. No active policy changed.
@@ -835,4 +835,39 @@ committed the RL hardening plus additional accounting/data fixes at
 
 These results improve engineering correctness and reproducibility only. They do
 not create an authorized historical dataset, an authoritative NSE calendar,
-a continuous live runner, a profitability claim, or a GPU result.
+a verified live-feed deployment, a profitability claim, or a GPU result.
+
+## 23. Provider-independent continuous paper follow-up — 20 October 2026
+
+The finite historical replay runner was not duplicated. The missing operational
+boundary was added as a separate offline/replay capability:
+
+- `trading_agent.data.stream` defines `ProviderIdentity`, `CompletedBarEvent`,
+  `CompletedBarFeed`, deterministic `ReplayBarFeed`, finite
+  `RangeProviderFeed`, and bounded `RetryPolicy`/`fetch_with_retry`.
+- `trading_agent.continuous.ContinuousPaperRunner` consumes completed bars
+  only after their availability boundary, records provider/provenance identity,
+  bar timestamp, availability timestamp and local receipt timestamp, rejects
+  non-monotonic or irregular bars, records stale-feed health, and never
+  substitutes synthetic data for a provider failure.
+- The runner reuses the canonical `PaperBroker`, `PortfolioLedger`,
+  `RiskSupervisor` and `SQLiteRepository`. Its cursor, pending policy action,
+  observation, history digest, broker revision and ledger hash are persisted as
+  one rollback unit. It supports deterministic replay, restart continuation,
+  bounded polling retries, graceful stop and a persistent paper-only kill
+  switch. The CLI surface is `paper-stream`.
+- Cash and diagnostic rule policies are exposed by the CLI; arbitrary compatible
+  policy callables remain injectable through the runner constructor. Each
+  transition stores policy identity plus feature/reward/execution/cost/risk
+  compatibility metadata. No order endpoint or provider credential path was
+  added.
+- Ten targeted tests were added; the full project-local offline suite is now
+  **259 passed**, with a CLI replay/resume smoke check. This verifies replay and
+  mocked/provider-boundary behavior only. SmartAPI remains mock-tested, live
+  entitlement/streaming is unverified, and no real order route exists.
+- Because `causal-open-v4` intentionally rejects pre-v4 compatibility artifacts,
+  the default demo moved from the preserved `models/initial-v2/` and
+  `runs/demo-v2/` paths to new `models/initial-v3/` and `runs/demo-v3/` paths.
+  `make demo` completed there with restart verification; the synthetic v3
+  candidate ended at ₹9,582.25 after 260 fills and ₹149.70 fees and was
+  rejected. No prior artifact was overwritten.

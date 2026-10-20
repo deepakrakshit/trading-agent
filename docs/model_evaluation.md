@@ -161,10 +161,9 @@ Exact commands:
 .venv/bin/python -m trading_agent.cli evaluate --experiment models/cpu-audit-v1 --device cpu
 ```
 
-## Current v2 offline demo receipt
+## Preserved pre-v4 v2 offline demo receipt
 
-The default CLI demo now uses `models/initial-v2/` and `runs/demo-v2/` so the
-preserved v1 artifacts cannot be overwritten. The recorded local v2 audit used
+The recorded local v2 audit used
 an explicit 256-step override: **3.5950 seconds**, checkpoint
 `models/initial-v2/checkpoints/step-00000256.pt` with SHA-256
 `af252036a16f07d0c5a48b74954f733ebe71f74eb6493e94a3902899a76d5b31`, final
@@ -172,3 +171,18 @@ shadow equity ₹9,698.67, 183 fills, ₹67.88 fees, and a rejected candidate.
 `make demo` subsequently resumed this durable account and verified the pinned
 evaluation receipt without adding fills. This remains synthetic engineering
 evidence, not profitability evidence.
+
+The execution contract is now `causal-open-v4` for the completed-bar runner.
+The default CLI demo therefore uses new `models/initial-v3/` and
+`runs/demo-v3/` paths; the pre-v4 v2 checkpoint/account is preserved and
+intentionally rejected by the current compatibility loader rather than
+silently migrated. Run `make demo` to create the v3-compatible receipt.
+
+## Current execution-v4 v3 offline demo receipt
+
+`make demo` was executed after the execution-v4 transition using the new
+`models/initial-v3/` and `runs/demo-v3/` paths. The synthetic candidate ended
+with shadow equity **₹9,582.25**, **260 fills**, **₹149.70 fees**, and a **rejected**
+promotion decision. The diagnostic rule account ended at ₹9,255.21 with 230
+fills and ₹274.39 fees. Restart verification passed. This is engineering and
+accounting evidence only; it is not historical/live performance evidence.

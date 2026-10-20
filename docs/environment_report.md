@@ -127,3 +127,27 @@ Further diagnosis: **Secure Boot enabled**; the running kernel lacks the NVIDIA 
   wheel environment, but `.venv-cuda/bin/python -m trading_agent.cli
   doctor --require-cuda` still exits 2. The driver/kernel blocker is unchanged;
   no privileged repair, reboot or GPU training was attempted.
+
+## Completed-bar continuous paper follow-up (20 October 2026)
+
+- Added a provider-independent `CompletedBarFeed` boundary with deterministic
+  replay, finite range adaptation, explicit provider/provenance identity,
+  completed-bar availability and local receipt timestamps, and bounded retries
+  that never substitute synthetic data.
+- Added `ContinuousPaperRunner`, which reuses `PaperBroker`,
+  `PortfolioLedger`, `RiskSupervisor` and `SQLiteRepository`. Its durable
+  cursor is transactionally coupled to the broker checkpoint and supports
+  restart continuation, stale-feed health records, graceful stop, and a
+  persistent paper-only kill switch. The CLI surface is `paper-stream`.
+- The follow-up added ten tests (bringing the suite from 249 to **259
+  passed**) and was verified with `.venv-repro`. A two-command synthetic
+  `paper-stream`/`--resume` smoke check processed separate event batches and
+  retained the same SQLite account.
+- `make demo` was rerun with the new execution-v4-compatible default paths
+  `models/initial-v3/` and `runs/demo-v3/`; it completed, verified restart
+  recovery, and rejected the synthetic candidate at ₹9,582.25 after 260 fills
+  and ₹149.70 fees. The pre-v4 v2 artifacts were preserved rather than
+  overwritten.
+- This is deterministic offline/replay evidence only. The live SmartAPI
+  adapter remains mock-tested, no live entitlement or credentials were used,
+  and no real order route was added.

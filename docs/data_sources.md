@@ -27,7 +27,7 @@ These are the **only** allowed HTTP routes in the application's provider. Order 
 - SmartAPI's default **one request/second** is a conservative *local cap*, not a claimed official rate limit. Current official limits must be confirmed locally. Retries respect bounded `Retry-After`; auth failures stop rather than loop.
 - Reliability is tested with scripted disconnects/timeouts/429s/malformed/stale responses. **Actual provider uptime, response conventions, permissions and latency remain unverified.**
 - `quote` returns **READ_ONLY_POLL** observations with provider and receipt timestamps; it is not called verified LIVE. A fresh heartbeat with an old/missing last-trade timestamp is rejected.
-- WebSocket functionality was researched in the official SDK, but a continuously streaming live-paper engine and operational reconnection were not validated. This delivery must not be described as a working live NSE feed.
+- WebSocket functionality was researched in the official SDK, but live entitlement/access, a verified live NSE feed, and deployment-grade operational reconnection were not validated. The repository now has a provider-independent completed-bar replay/polling boundary with bounded retry, but it must not be described as a working live NSE feed.
 - The quote adapter additionally rejects an optional provider `tradingSymbol`
   that disagrees with the caller's explicit symbol/token mapping. This is
   scripted-response evidence only; it does not verify a real instrument master.
