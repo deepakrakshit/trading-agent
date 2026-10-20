@@ -171,7 +171,11 @@ class PaperBroker:
     """
 
     STATE_KEY = "paper_broker_v1"
-    EXECUTION_VERSION = "causal-open-v3"
+    # v4 makes the completed-bar availability boundary explicit: an order
+    # submitted exactly when a bar becomes available may fill at the open
+    # event carrying that same timestamp. Older checkpoints are rejected by
+    # their compatibility contract instead of silently changing semantics.
+    EXECUTION_VERSION = "causal-open-v4"
     _STATE_KEY = STATE_KEY
 
     def __init__(
@@ -260,8 +264,8 @@ class PaperBroker:
         provide all sizing inputs.  This is planning only, and never moves cash.
         """
 
-        if event.timestamp <= utc_timestamp(decision_at):
-            raise ValueError("a target requires a strictly later eligible open")
+        if event.timestamp < utc_timestamp(decision_at):
+            raise ValueError("a target requires an eligible open at or after decision availability")
         weight = decimal_value(target_weight, "target_weight")
         if not 0 <= weight <= 1:
             raise ValueError("target_weight must lie in [0, 1]")
@@ -385,7 +389,9 @@ class PaperBroker:
             raise ValueError("out-of-order or conflicting duplicate execution bar")
         with self.atomic():
             results = self.process_open(
-                PaperOpenEvent(bar.symbol, bar.timestamp, bar.open), as_of=as_of
+                PaperOpenEvent(bar.symbol, bar.timestamp, bar.open),
+                as_of=as_of,
+                allow_same_timestamp=False,
             )
             completed_at = bar.timestamp + self.bar_interval
             observation_clock = completed_at if as_of is None else max(utc_timestamp(as_of), completed_at)
@@ -393,15 +399,24 @@ class PaperBroker:
         return results
 
     def process_open(
-        self, event: PaperOpenEvent, *, as_of: datetime | None = None
+        self,
+        event: PaperOpenEvent,
+        *,
+        as_of: datetime | None = None,
+        allow_same_timestamp: bool = True,
     ) -> tuple[ExecutionReceipt, ...]:
         """Fill queued paper orders with event-time information only.
 
         Participation defaults to the *previously observed* candle's volume.
         With neither that history nor explicit event liquidity, fills fail
-        closed.  Post-fill safety uses the actual candidate account context.
+        closed.  ``allow_same_timestamp`` is used by the completed-bar runner
+        when a decision becomes available exactly at the next open; the legacy
+        ``process_bar`` convenience path keeps strict next-bar behavior.
+        Post-fill safety uses the actual candidate account context.
         """
 
+        if not isinstance(allow_same_timestamp, bool):
+            raise ValueError("allow_same_timestamp must be boolean")
         clock = utc_timestamp(as_of or event.timestamp)
         self._assert_clock(clock)
         previous_open = self._last_opens.get(event.symbol)
@@ -427,8 +442,9 @@ class PaperBroker:
             self._begin_session(event.timestamp)
             for order in self.pending_orders():
                 if (
-                    order.symbol != event.symbol or event.timestamp <= order.submitted_at
-                    or event.timestamp < order.sized_at
+                    order.symbol != event.symbol
+                    or (event.timestamp <= order.submitted_at if not allow_same_timestamp else event.timestamp < order.submitted_at)
+                    or (event.timestamp <= order.sized_at if not allow_same_timestamp else event.timestamp < order.sized_at)
                 ):
                     continue
                 candidate = PortfolioLedger.from_state(self.ledger.export_state())

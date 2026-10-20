@@ -15,7 +15,15 @@ from .data import (
     SyntheticBarProvider,
     synthetic_bars,
     validate_bars,
+    CompletedBarEvent,
+    CompletedBarFeed,
+    ProviderIdentity,
+    ReplayBarFeed,
+    RangeProviderFeed,
+    RetryPolicy,
+    fetch_with_retry,
 )
+from .continuous import ContinuousPaperRunner, ContinuousRunnerStatus
 from .execution import ExecutionReceipt, OrderRequest, PaperBroker
 from .features import CausalFeatureBuilder, FeatureRow
 from .portfolio import (
@@ -55,4 +63,13 @@ __all__ = [
     "SyntheticBarProvider",
     "synthetic_bars",
     "validate_bars",
+    "CompletedBarEvent",
+    "CompletedBarFeed",
+    "ProviderIdentity",
+    "ReplayBarFeed",
+    "RangeProviderFeed",
+    "RetryPolicy",
+    "fetch_with_retry",
+    "ContinuousPaperRunner",
+    "ContinuousRunnerStatus",
 ]

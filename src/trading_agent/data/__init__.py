@@ -9,6 +9,17 @@ from .providers import (
     synthetic_bars,
 )
 from .validation import validate_bars
+from .stream import (
+    CompletedBarEvent,
+    CompletedBarFeed,
+    FeedError,
+    FeedUnavailableError,
+    ProviderIdentity,
+    RangeProviderFeed,
+    ReplayBarFeed,
+    RetryPolicy,
+    fetch_with_retry,
+)
 
 __all__ = [
     "DataProvenance",
@@ -20,4 +31,13 @@ __all__ = [
     "SyntheticBarProvider",
     "synthetic_bars",
     "validate_bars",
+    "CompletedBarEvent",
+    "CompletedBarFeed",
+    "FeedError",
+    "FeedUnavailableError",
+    "ProviderIdentity",
+    "RangeProviderFeed",
+    "ReplayBarFeed",
+    "RetryPolicy",
+    "fetch_with_retry",
 ]

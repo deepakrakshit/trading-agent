@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
 import sys
 
-from .config import load_config
-from .data import CSVBarProvider
+from .config import cost_model, load_config, risk_limits
+from .continuous import ContinuousPaperRunner
+from .data import CSVBarProvider, ProviderIdentity, ReplayBarFeed
+from .data.persistence import load_snapshot
 from .data.persistence import write_snapshot
 from .diagnostics import benchmark, doctor, resolve_device
 from .registry import CandidateRegistry
 from .runner import inspect_account, run_paper, set_kill_switch
+from .evaluation import CashBaseline, RuleBaseline
+from .storage import SQLiteRepository
 from .workflow import (
     evaluate_experiment, generate_synthetic, jsonable, read_json, save_json, train_experiment,
 )
@@ -56,6 +60,14 @@ def parser() -> argparse.ArgumentParser:
     paper.add_argument("--shadow", action="store_true")
     paper.add_argument("--resume", action="store_true")
     paper.add_argument("--max-steps", type=int)
+    stream = sub.add_parser("paper-stream", help="Provider-independent completed-bar paper runner")
+    stream.add_argument("--data", default="data/raw/synthetic.parquet")
+    stream.add_argument("--db", default="runs/stream/account.sqlite")
+    stream.add_argument("--strategy", choices=("cash", "rule"), default="cash")
+    stream.add_argument("--max-bars", type=int)
+    stream.add_argument("--resume", action="store_true")
+    stream.add_argument("--kill", action="store_true")
+    stream.add_argument("--clear-kill", action="store_true")
     account = sub.add_parser("account", help="Inspect durable account, equity, fills, orders or transitions")
     account.add_argument("--db", default="runs/demo/account.sqlite")
     account.add_argument("--view", choices=("summary", "orders", "fills", "equity", "transitions", "events"), default="summary")
@@ -142,6 +154,64 @@ def provider_command(args, config):
     return [asdict(quote) | {"freshness_seconds": (quote.received_at - quote.timestamp).total_seconds()} for quote in provider.poll(args.symbol, count=args.count)]
 
 
+def stream_replay(args, config):
+    """Run the provider-independent completed-bar runner over one snapshot."""
+
+    if args.kill and args.clear_kill:
+        raise ValueError("choose at most one of --kill and --clear-kill")
+    db = Path(args.db)
+    if db.exists() and not args.resume:
+        raise FileExistsError("continuous paper account exists; use --resume")
+    snapshot = load_snapshot(args.data)
+    symbols = sorted({bar.symbol for bar in snapshot.bars})
+    if len(symbols) != 1:
+        raise ValueError("paper-stream requires exactly one instrument")
+    symbol = symbols[0]
+    metadata = snapshot.manifest.source_metadata
+    identity = ProviderIdentity(
+        provider_id=snapshot.manifest.source,
+        provenance=snapshot.manifest.provenance,
+        interval=timedelta(minutes=5),
+        calendar_version=metadata.get("calendar_version", "SNAPSHOT_UNSPECIFIED"),
+        source_metadata=metadata,
+    )
+    policy = CashBaseline() if args.strategy == "cash" else RuleBaseline(long_action=len(config["target_exposures"]) - 1)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteRepository(db) as repository:
+        runner = ContinuousPaperRunner(
+            repository,
+            symbol=symbol,
+            provider=identity,
+            policy=policy,
+            policy_id=f"{args.strategy}-stream-v1",
+            initial_cash=config["initial_cash"],
+            cost_model=cost_model(config),
+            risk_limits=risk_limits(config, symbol),
+            target_exposures=config["target_exposures"],
+            participation_limit=config["participation_limit"],
+            config_version=config["version"],
+        )
+        if args.kill or args.clear_kill:
+            return runner.set_kill_switch(args.kill, reason="CLI continuous paper kill switch")
+        feed = ReplayBarFeed(snapshot.bars, identity)
+        end = snapshot.manifest.end + identity.interval
+        last_timestamp = runner.status().last_bar_timestamp
+        after = datetime.fromisoformat(last_timestamp) if last_timestamp else None
+        events = feed.fetch(symbol, after, end, as_of=end)
+        results = runner.run_events(events, max_events=args.max_bars)
+        report = {
+            "paper_only": True,
+            "mode": "CONTINUOUS_PAPER_REPLAY",
+            "provider": identity.to_mapping(),
+            "strategy": args.strategy,
+            "events_processed": len(results),
+            "status": asdict(runner.status()),
+            "note": "Completed-bar provider-independent replay; not a verified live feed.",
+        }
+        save_json(db.with_suffix(".stream.report.json"), report)
+        return report
+
+
 def dispatch(args, config):
     if args.command == "doctor":
         report = doctor()
@@ -163,6 +233,8 @@ def dispatch(args, config):
     if args.command == "paper":
         report = run_paper(args.experiment, args.db, strategy=args.strategy, shadow=args.shadow, resume=args.resume, max_steps=args.max_steps, registry_path=args.registry)
         return {key: value for key, value in report.items() if key != "attribution"} | {"detailed_report": str(Path(args.db).with_suffix(".report.json"))}
+    if args.command == "paper-stream":
+        return stream_replay(args, config)
     if args.command == "account":
         result = inspect_account(args.db, view=args.view)
         if args.output:

@@ -26,3 +26,25 @@ def test_missing_provider_secrets_are_not_requested_as_arguments_or_logged(capsy
     with patch.dict("os.environ", {}, clear=True):
         assert main(["quote", "--symbol", "EXAMPLE", "--instrument-token", "1"]) == 1
     assert "locally" in json.loads(capsys.readouterr().err)["message"]
+
+
+def test_continuous_paper_stream_cli_replays_and_resumes_a_snapshot(tmp_path, capsys):
+    data = str(tmp_path / "synthetic.csv")
+    db = str(tmp_path / "stream.sqlite")
+    assert main(["generate", "--sessions", "2", "--output", data]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "paper-stream", "--data", data, "--db", db, "--strategy", "cash", "--max-bars", "2",
+    ]) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert first["mode"] == "CONTINUOUS_PAPER_REPLAY"
+    assert first["events_processed"] == 2
+    assert first["paper_only"] and first["provider"]["provenance"] == "SYNTHETIC"
+
+    assert main([
+        "paper-stream", "--data", data, "--db", db, "--strategy", "cash", "--resume", "--max-bars", "2",
+    ]) == 0
+    resumed = json.loads(capsys.readouterr().out)
+    assert resumed["events_processed"] == 2
+    assert resumed["status"]["transitions"] == 3
