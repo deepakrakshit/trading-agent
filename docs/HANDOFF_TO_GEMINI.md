@@ -13,7 +13,7 @@
   - `53dbfb9 feat: add continuous paper replay runner`
   - `ef19f24 docs: record continuous paper handoff`
   - `c189573 docs: record final reproducibility receipt`
-- The handoff was first committed as `1d5517e`, finalized in the documentation commits through `e0ab421`, and pushed to `origin/main`; verify the remote before starting new work.
+- The handoff was first committed as `1d5517e`, finalized in later documentation-only commits, and pushed to `origin/main`; verify the remote before starting new work.
 
 ## Executive Summary
 
@@ -508,8 +508,8 @@ clean archive path is shown.
 - The same clean source-archive check was repeated at handoff commit `1d5517e`
   and again passed **259 tests**, compilation and `pip check`.
 - The last full source-archive check at `d37f398` also passed **259 tests**,
-  compilation and `pip check`; the later `e0ab421` change was documentation-only
-  and was rechecked with `make test`.
+  compilation and `pip check`; later handoff-only documentation changes were
+  rechecked with `make test`.
 - Docker build/run — **not run**; `docker --version` is unavailable.
 - Dedicated lint/typecheck — **not configured/not run**.
 
@@ -542,7 +542,7 @@ reported `paper_only: true` and `provenance: SYNTHETIC`.
 ## Recommended Next Steps
 
 1. Verify `git status --short`, `git log --oneline -5`, and that `origin/main`
-   contains `e0ab421` before changing anything.
+   matches the local HEAD before changing anything.
 2. On Windows, create project-local Python 3.14.4 environments and run the
    full offline suite before attempting any data/GPU work. Treat Windows
    dependency resolution as a separate pinned lockfile task.
@@ -657,6 +657,6 @@ wants only offline replay versus a real read-only live feed. Never guess.
 
 ## Immediate Next Action
 
-Verify that `origin/main` is at `e0ab421` and that the worktree is clean, then
+Verify that `origin/main` matches the local HEAD and that the worktree is clean, then
 start Windows environment verification. No real provider or GPU repair should
 be attempted before that evidence exists.
