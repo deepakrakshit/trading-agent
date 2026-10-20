@@ -50,7 +50,7 @@ make demo
 
 On a fresh checkout this creates 24 **SYNTHETIC weekday** sessions, trains 3,000 Double-DQN interaction steps into the new `models/initial-v2/` experiment, saves/reloads checkpoints, runs three-seed walk-forward evaluation and cash/rule/random baselines, and restarts a SQLite shadow paper account under `runs/demo-v2/`. On subsequent runs it resumes that v2 account and reads its pinned evaluation receipt; it does **not** retune on that holdout. Preserved v1 artifacts are historical receipts and are rejected by the current loader rather than overwritten.
 
-Actual first run: **₹9,502.08** final shadow equity, **311 paper fills / 29 closed inventory round trips**, and **₹188.32 explicit fees**. The candidate was rejected; the separate active-policy account remains **₹10,000 cash**. These synthetic results demonstrate the software, not a profitable strategy. Details: `docs/model_evaluation.md`.
+The preserved historical v1 run ended at **₹9,502.08** with **311 paper fills / 29 closed inventory round trips** and **₹188.32 explicit fees**. The current v2 audit receipt ended at **₹9,698.67** with 183 fills and **₹67.88 fees** after an explicit 256-step CPU override. Both candidates were rejected; the separate active-policy fallback remains cash. These synthetic results demonstrate the software, not a profitable strategy. Details: `docs/model_evaluation.md`.
 
 ## Individual workflow commands
 
@@ -100,9 +100,12 @@ Run from the repository root. The first `generate` command is for a fresh path: 
 
 ### Controlled paper-experience learning
 
-`--experience-db` trains a **new candidate** from recorded numerical transitions, not from loss narratives and not by updating active weights after a trade. New paper accounts write a `paper-experience-v1` manifest beside the SQLite database. Import verifies the source dataset and slice hashes, instrument, feature/action/reward/execution/cost/risk versions, policy/account identity, contiguous history digest, and cutoff. It rejects observations after the new training cutoff or with different provenance/features/action/risk/cost settings. The earlier holdout may become training history only in a **new** chronological experiment with a later untouched test block.
+`--experience-db` trains a **new candidate** from recorded numerical transitions, not from loss narratives and not by updating active weights after a trade. New paper accounts write a `paper-experience-v1` manifest beside the SQLite database, including the pinned snapshot-manifest digest and completed-bar interval. Import verifies the source dataset and slice hashes, instrument, feature/action/reward/execution/cost/risk versions, policy/account identity, contiguous history digest, completion boundary and cutoff. It rejects observations after the new training cutoff or with different provenance/features/action/risk/cost settings. The earlier holdout may become training history only in a **new** chronological experiment with a later untouched test block.
 
-This exact additional offline cycle was executed:
+This exact additional offline cycle was executed before the v2 migration policy
+and is preserved as a historical receipt. Do not rerun it against the preserved
+v1 account; create a new v2 paper account for a new chronological experiment.
+The historical commands were:
 
 ```bash
 .venv-cuda/bin/python -m trading_agent.cli generate --output data/raw/synthetic-expanded.parquet --sessions 48

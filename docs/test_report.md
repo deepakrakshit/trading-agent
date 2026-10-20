@@ -2,7 +2,7 @@
 
 ## Final test state
 
-The combined suite currently contains **248 tests: 248 passed, 0 failed, 0 skipped** in the restored `.venv` environment. The run emitted **65 warnings**: intentional deprecation notices for the legacy injected-execution compatibility environment and two advisory Gymnasium warnings for that legacy environment's unbounded observation space. The canonical CLI environment has finite float32 bounds and passes the checker. Warnings were not suppressed.
+The combined suite currently contains **249 tests: 249 passed, 0 failed, 0 skipped** in the restored `.venv` environment. The run emitted **65 warnings**: intentional deprecation notices for the legacy injected-execution compatibility environment and two advisory Gymnasium warnings for that legacy environment's unbounded observation space. The canonical CLI environment has finite float32 bounds and passes the checker. Warnings were not suppressed.
 
 `tests/conftest.py` blocks socket connections automatically. The single offline test command is:
 
@@ -16,15 +16,16 @@ It runs pytest, source/test compilation and `pip check`; it does not download da
 
 | Check | Actual result |
 | --- | --- |
-| `make test` in `.venv` | 248 passed; compilation and dependency check passed |
+| `make test` in `.venv` | 249 passed; compilation and dependency check passed |
 | `make test PYTHON=.venv-cuda/bin/python` | Same CPU-mode suite passed with the CUDA-enabled wheel; not GPU execution evidence |
-| Fresh `.venv-repro`, lock install, editable install, `make test PYTHON=.venv-repro/bin/python` | 248 passed, 0 skipped; compilation and dependency check passed |
+| Fresh `.venv-repro`, lock install, editable install, `make test PYTHON=.venv-repro/bin/python` | 249 passed, 0 skipped; compilation and dependency check passed |
 | Canonical `Gymnasium check_env` | Passed in the test suite |
 | `git diff --check` | Passed for working code steps |
 | `.venv-cuda/bin/python -m trading_agent.cli doctor --require-cuda` | **Exit 2:** no usable CUDA device/driver |
 | `.venv-cuda/bin/python -m trading_agent.cli train --device cuda --output models/cuda-verification-only --steps 16` | **Exit 1:** refused CPU fallback for explicit CUDA request; no training run created |
 | Two `apt-get --simulate install` attempts | Failed dependency resolution; no system modification |
 | `docker --version` | Command not found; Docker build/run **not executed** |
+| `git archive HEAD` into a clean temporary checkout + `make test PYTHON=/home/deepakrakshit/trading_agent/.venv-repro/bin/python` | **249 passed**; compilation and `pip check` passed; no ignored data/models/runs were present in the source archive |
 | Dedicated linter/typechecker | Not configured/run; compilation is not claimed as static typing or lint coverage |
 
 ## Behaviors covered
@@ -66,10 +67,11 @@ python3 -m venv .venv-cuda
 make test PYTHON=.venv-cuda/bin/python
 
 # Full actual synthetic demo, candidate training, frozen evaluation and restarted paper account
-.venv-cuda/bin/python -m trading_agent.cli demo --device auto
+.venv/bin/python -m trading_agent.cli demo --device auto
+.venv/bin/python -m trading_agent.cli demo --experiment models/initial-v2 --output runs/demo-v2 --steps 256 --device cpu
 .venv-cuda/bin/python -m trading_agent.cli benchmark --steps 500 --output runs/benchmark.json
-.venv-cuda/bin/python -m trading_agent.cli paper --db runs/demo/account.sqlite --resume
-.venv-cuda/bin/python -m trading_agent.cli account --db runs/demo/account.sqlite
+.venv/bin/python -m trading_agent.cli paper --db runs/demo-v2/account.sqlite --resume
+.venv/bin/python -m trading_agent.cli account --db runs/demo-v2/account.sqlite
 
 # Separate safe active-policy account and durable operator kill latch
 .venv/bin/python -m trading_agent.cli paper --experiment models/initial-v1 --db runs/active/account.sqlite --strategy active
@@ -80,6 +82,10 @@ make test PYTHON=.venv-cuda/bin/python
 .venv-cuda/bin/python -m trading_agent.cli train --data data/raw/synthetic-expanded.parquet --output models/paper-replay-v2 --steps 1000 --experience-db runs/demo/account.sqlite --device auto
 .venv-cuda/bin/python -m trading_agent.cli evaluate --experiment models/paper-replay-v2 --device auto
 
+# Fresh committed-source CPU audit candidate
+.venv/bin/python -m trading_agent.cli train --data data/raw/synthetic.parquet --output models/cpu-audit-v1 --steps 64 --device cpu
+.venv/bin/python -m trading_agent.cli evaluate --experiment models/cpu-audit-v1 --device cpu
+
 # Empty-environment reproducibility
 python3 -m venv .venv-repro
 .venv-repro/bin/python -m pip install --cache-dir .cache/pip --timeout 30 --retries 2 -r requirements.lock
@@ -88,6 +94,10 @@ make test PYTHON=.venv-repro/bin/python
 ```
 
 `auto` selected **CPU** because the CUDA probe failed. No test output, GPU run, live connection or profitable result was fabricated. Setup/dependency installation needed public package-network access; subsequent tests were offline.
+
+The continuation audit also verified a source-only `git archive` checkout using
+the already-installed project-local `.venv-repro`; it did not claim a Docker
+build or a fresh dependency download in that temporary checkout.
 
 ## Audit fixes made before handoff
 
@@ -100,6 +110,8 @@ make test PYTHON=.venv-repro/bin/python
 - Kept immutable per-step checkpoints so a crash cannot destroy the prior manifest/checkpoint pair.
 - Removed exit-candle future high/low from holding-window MFE/MAE.
 - Corrected walk-forward independent-session counting. Existing rejected receipts/scores remain archived, with a separate correction audit; see `docs/model_evaluation.md`.
+- Enforced completed-bar availability and monotonic replay clocks, prevented stale omitted marks for held symbols, reconciled restored ledgers against fill records, and made CSV completion values strict.
+- Pinned snapshot-manifest hashes into experiments/paper experience, reused the original snapshot capture boundary during reload, and hash-checked consumed evaluation receipts.
 
 ## T1 RL pipeline hardening
 

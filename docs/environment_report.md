@@ -110,3 +110,20 @@ Further diagnosis: **Secure Boot enabled**; the running kernel lacks the NVIDIA 
 ## Container limitation
 
 `docker --version` returned `command not found`. The maintained Dockerfile pins Python, installs system libraries and the lock, builds the package and runs `make test`, but a Docker build/run was **not executed** on this host. Fresh-venv reproducibility was executed and verified instead; it is not presented as a container test.
+
+## Continuation audit (20 October 2026)
+
+- Current committed revision: `2835cd2` (`fix: harden paper timing accounting and data provenance`).
+- The source archive was extracted into a clean temporary directory without
+  ignored `data/`, `models/`, `runs/`, virtual-environment or cache contents.
+  Running `make test PYTHON=/home/deepakrakshit/trading_agent/.venv-repro/bin/python`
+  from that archive passed **249 tests**, compilation and `pip check`.
+  This is a clean-source verification using an existing project-local venv,
+  not a Docker build or a fresh package download.
+- A fresh CPU audit candidate used `.venv` / PyTorch `2.10.0+cpu`, 64
+  interactions, one optimizer update and **0.5981 seconds**. The checkpoint
+  reloaded and produced valid action `4`; peak VRAM remained `null`.
+- `make test PYTHON=.venv-cuda/bin/python` passed **249 tests** in the CUDA
+  wheel environment, but `.venv-cuda/bin/python -m trading_agent.cli
+  doctor --require-cuda` still exits 2. The driver/kernel blocker is unchanged;
+  no privileged repair, reboot or GPU training was attempted.

@@ -21,6 +21,11 @@ ORDER = OrderRequest("buy", "ABC", "BUY", 2, NOW)
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_sqlite_open_sets_bounded_lock_wait_and_checks_integrity(self) -> None:
+        with SQLiteRepository() as repo:
+            self.assertEqual(repo.connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(repo.connection.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
     def test_events_and_transitions_are_idempotent_but_conflicts_fail(self) -> None:
         with SQLiteRepository() as repo:
             self.assertTrue(repo.append_event("one", "TEST", {"value": 1}, occurred_at=NOW, idempotency_key="key"))

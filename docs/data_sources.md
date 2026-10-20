@@ -28,6 +28,9 @@ These are the **only** allowed HTTP routes in the application's provider. Order 
 - Reliability is tested with scripted disconnects/timeouts/429s/malformed/stale responses. **Actual provider uptime, response conventions, permissions and latency remain unverified.**
 - `quote` returns **READ_ONLY_POLL** observations with provider and receipt timestamps; it is not called verified LIVE. A fresh heartbeat with an old/missing last-trade timestamp is rejected.
 - WebSocket functionality was researched in the official SDK, but a continuously streaming live-paper engine and operational reconnection were not validated. This delivery must not be described as a working live NSE feed.
+- The quote adapter additionally rejects an optional provider `tradingSymbol`
+  that disagrees with the caller's explicit symbol/token mapping. This is
+  scripted-response evidence only; it does not verify a real instrument master.
 
 ## Canonical data handling
 
@@ -36,6 +39,13 @@ The application stores immutable CSV/Parquet data with a separate manifest: sour
 Bar timestamps are **BAR_START** in aware UTC; exchange sessions use **Asia/Kolkata**. Five-minute features become available at bar start + five minutes. The environment logs `decision_available_at`, next-open `fill_timestamp`, and `reward_available_at` explicitly. At an adjacent bar boundary this assumes a zero-latency decision with adverse spread/slippage; real execution latency is not reconstructed from OHLCV.
 
 Validation rejects malformed OHLCV, NaN/infinity/nonpositive prices, duplicate/out-of-order rows, incomplete/forming candles, future/unavailable records, wrong symbols, missing scheduled intraday candles, and unreviewed 20% discontinuities/outlier ranges. It never sorts away a defect, forward-fills a tradable price, or silently switches provenance. Missing/zero volume cannot invent fill liquidity. At an open, participation uses **prior completed volume**, not the future completed volume of the fill candle.
+
+The generic CSV/snapshot boundary enforces the same five-minute `BAR_START`
+contract: CSV `complete` values are strict booleans, capture time must be at
+least one interval after every imported bar start, and unknown columns are
+rejected. Snapshot manifest hashes are pinned into new experiment and
+paper-account receipts; reloads validate against the original snapshot capture
+time rather than the current wall clock.
 
 The default calendar is explicitly a **weekday NSE-style schedule**, not an authoritative holiday calendar. Synthetic sessions can include dates such as 26 January that are not real NSE trading sessions. Supply verified holidays/exceptional sessions for real data. Corporate actions, adjusted-vs-raw prices and point-in-time symbol/universe histories require source-specific work; large discontinuities fail closed rather than fabricate an adjustment.
 

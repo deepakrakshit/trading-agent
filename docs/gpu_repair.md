@@ -43,3 +43,12 @@ make test PYTHON=.venv-cuda/bin/python
 The `doctor --require-cuda` command must run a real tensor operation on the GPU and exit nonzero if it cannot. Installing the CUDA wheel alone does not repair the missing kernel module and is not GPU-training evidence.
 
 Keep `.venv` as a CPU fallback. After driver repair, use `--device cuda` explicitly or the CLI's verified `auto` selection; training must fail rather than silently run on CPU when `cuda` was explicitly requested.
+
+## Recheck on 20 October 2026
+
+The project-local CUDA wheel and host state were rechecked after the CPU/data
+hardening work. `make test PYTHON=.venv-cuda/bin/python` passed 249 tests, but
+`doctor --require-cuda` still exited 2 with `torch.cuda.is_available() ==
+False`, device count 0, and `nvidia-smi` exit code 9. The running kernel is
+still `7.0.0-34-generic` without a communicating NVIDIA module. No driver
+upgrade, Secure Boot change, root command or reboot was attempted.

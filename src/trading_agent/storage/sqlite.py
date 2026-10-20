@@ -57,8 +57,16 @@ class SQLiteRepository:
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self._transaction_depth = 0
-        self._create_schema()
+        try:
+            self._create_schema()
+            integrity = self.connection.execute("PRAGMA integrity_check").fetchone()[0]
+            if integrity != "ok":
+                raise PersistenceError(f"SQLite integrity check failed: {integrity}")
+        except BaseException:
+            self.connection.close()
+            raise
 
     def close(self) -> None:
         """Close the underlying connection."""

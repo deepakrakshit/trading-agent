@@ -97,3 +97,31 @@ make test
 
 The authoritative result is reported in `docs/test_report.md`; no CUDA claim
 is implied by these checks.
+
+## Continuation audit fixes (T2/T4)
+
+The independent accounting/data audits found and fixed additional unblocked
+correctness issues:
+
+- An explicit replay clock cannot receive a next-bar close/reward before
+  `bar_start + interval`, and accepted clocks cannot move backwards. Open-event
+  market-hours checks still use the actual eligible open while feed freshness
+  uses the supplied observation clock.
+- A later global mark now requires a fresh mark for every held symbol. Ledger
+  restore validates fill/order idempotency sets, reconstructs the fill ledger,
+  and rejects inconsistent cash, P&L, fees, positions or high-water marks.
+- Direct canonical environments reject missing bars inside a local exchange
+  session. CSV imports parse `complete` strictly, reject forming candles at an
+  injected capture time, and reject unknown columns. Canonical CSV snapshots
+  round-trip through the CSV provider.
+- Experiments, paper accounts and experience manifests carry a pinned snapshot
+  manifest digest. Historical reload validation uses the snapshot's immutable
+  capture boundary rather than the current wall clock. Consumed evaluation
+  receipts require a separate SHA-256 sidecar.
+- Read-only quote responses are rejected when an optional returned
+  `tradingSymbol` disagrees with the configured symbol/token mapping.
+
+The current paper execution contract is `causal-open-v3`; old v1/v2 generated
+artifacts remain preserved and are not silently migrated. The post-fix suite is
+249 passing tests, and the exact CPU/demo evidence is in
+`docs/model_evaluation.md` and `docs/test_report.md`.

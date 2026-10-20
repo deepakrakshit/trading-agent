@@ -797,10 +797,42 @@ The canonical architecture above was retained: validated data → causal feature
 - Initial actions request **0%, 6.25%, 12.5%, 18.75%, 25%** exposure for one explicitly named instrument. The independent single-name/gross cap is 25%; virtual balance is ₹10,000. Costs are a versioned illustrative intraday schedule, not an exact provider bill.
 - Actual training produced `models/initial-v1/checkpoints/step-00003000.pt`. The initial 3,000-interaction run used CPU and took 20.6236 seconds of measured training-loop time. A second candidate imported 449 persisted paper transitions under a later chronological cutoff, then trained and was evaluated separately.
 - Data is **SYNTHETIC**, replayed offline. The initial shadow account finished at ₹9,502.08 after 311 simulated fills and ₹188.32 explicit fees; no profitability claim is made. Both candidates were rejected. The separate active-policy account remains ₹10,000 cash with its operator kill latch engaged.
-- The combined offline suite has **225 passing tests**, zero failed/skipped, including genuine optimization/reload, causal next-open fills, risk, accounting, provider mocks, candidate gates and restart recovery. See `docs/test_report.md` for exact checks and qualifications.
+- The combined offline suite has **249 passing tests**, zero failed/skipped, including genuine optimization/reload, causal next-open fills, risk, accounting, provider mocks, candidate gates, restart recovery, strict provenance and receipt-integrity regressions. See `docs/test_report.md` for exact checks and qualifications.
 - An audit corrected duplicate boundary-date session counting across walk-forward windows. Existing financial scores and rejected receipts were preserved; separate audit artifacts show 7 and 13 unique evaluation dates, rather than treating overlapping window-sessions/seeds as independent samples.
 - The RTX 2050 is detected on PCI, but the running kernel lacks a matching NVIDIA module. CUDA-enabled PyTorch was installed locally and still reports zero usable devices. Two simulated Ubuntu package repairs failed due incompatible versions; no privileged system change/reboot occurred. User-controlled signed driver/kernel repair is required; see `docs/gpu_repair.md`.
 - SmartAPI's official FAQ/docs returned an authorization message. Public official SDK source was inspected, and only historical-candle/quote read-only routes were implemented and mock-tested. No authenticated/live feed, current entitlement, official rate limit, free-access promise or qualifying live paper-shadow history was fabricated.
 - Remaining scope includes authorised real history/calendar/corporate actions, verified live paper/shadow operation and deployment-consistent observations, execution stress, stronger research evidence/PPO comparison, dedicated drift monitoring and a real container build. Retraining is a deliberate CLI cycle, not an untested always-on schedule.
 
 Operational evidence and precise continuation steps are in `README.md`, `docs/environment_report.md`, `docs/data_sources.md`, `docs/model_evaluation.md` and `docs/test_report.md`. Keep future results in this same blueprint filename rather than creating duplicate canonical specifications.
+
+## 22. Continuation audit and unblocked hardening — 20 October 2026
+
+The continuation audit preserved the historical v1 checkpoints/accounts and
+committed the RL hardening plus additional accounting/data fixes at
+`2835cd2`:
+
+- The canonical execution contract is now `causal-open-v3`. A replay cannot
+  consume a next-bar close/reward before its completed availability time, and
+  accepted explicit clocks cannot move backwards. Open-session validation uses
+  the actual eligible open while feed freshness uses the observation clock.
+- Restored ledgers reconcile against their persisted fills, reject inconsistent
+  idempotency sets/high-water marks, and require fresh marks for every held
+  symbol when global time advances. SQLite opens with a busy timeout and
+  integrity check.
+- Direct CSV/snapshot ingestion enforces strict completion/columns and the
+  five-minute `BAR_START` contract. Experiment, paper, and experience receipts
+  pin the snapshot-manifest digest; historical reload uses the original capture
+  boundary. Consumed evaluations require a SHA-256 sidecar.
+- The default demo now uses new `models/initial-v2/` and `runs/demo-v2/` paths,
+  so preserved v1 artifacts cannot be overwritten. A fresh committed-source
+  CPU audit (`cpu-audit-v1`) executed 64 interactions in 0.5981 seconds,
+  reloaded action 4, evaluated independently, and was rejected on synthetic
+  data. No active policy changed.
+- A clean source archive with the existing project-local reproducibility venv
+  passed all **249 tests**, compilation and dependency checks. Docker remains
+  unexecuted because the command is unavailable. CUDA remains blocked by the
+  same host kernel/driver mismatch; no risky repair was attempted.
+
+These results improve engineering correctness and reproducibility only. They do
+not create an authorized historical dataset, an authoritative NSE calendar,
+a continuous live runner, a profitability claim, or a GPU result.

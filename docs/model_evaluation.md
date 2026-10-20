@@ -129,3 +129,46 @@ compatibility metadata and rejects the old files rather than silently
 reinterpreting them. Reuse requires a new versioned training cycle or an
 independently reviewed migration; the historical scores above are not
 rewritten.
+
+## Continuation CPU audit: `cpu-audit-v1`
+
+This is a fresh, deliberately small verification run from committed source
+revision `2835cd2a04f17d7a929e35c9572f2d52dfbcc9bd`. It does not replace either
+historical candidate.
+
+- Data: the same explicitly **SYNTHETIC** `data/raw/synthetic.parquet`,
+  dataset SHA-256 `1e3953f6ee637b8b92e15a60d937754ca845019b16bad4ff9d24731ea5850e11`,
+  snapshot-manifest SHA-256
+  `997ec1a2eaaaf481077a4fcd76410b2d46ebffdd278db5eb1fe7977f4fa0c58f`.
+- Configuration: seed 0, 9-observation/5-action MLP, CPU PyTorch
+  `2.10.0+cpu`, explicit `--device cpu`, 64 environment interactions, one
+  optimizer update, and **0.5981 seconds** measured training time.
+- Checkpoint: `models/cpu-audit-v1/checkpoints/step-00000064.pt`, SHA-256
+  `7ef33a71442df97b7fdf344bba2a01b3a0aa9f8c80f757adc626e56a9c96a62e`.
+- Reload evidence: checkpoint reload succeeded and produced action `4`, which
+  is valid in the exact target action space. `peak_vram_bytes` was `null`.
+- Frozen final holdout: **-2.2408%**, final equity approximately ₹9,775.92,
+  2.4074% maximum drawdown, ₹16.33 fees and 21 fill events across six
+  synthetic sessions.
+- Walk-forward: median compounded seed return **-1.4465%**, 7 unique session
+  dates, between-seed standard deviation 1.8143 percentage points. The
+  candidate was rejected; no active policy changed.
+
+Exact commands:
+
+```bash
+.venv/bin/python -m trading_agent.cli train --data data/raw/synthetic.parquet --output models/cpu-audit-v1 --steps 64 --device cpu
+.venv/bin/python -m trading_agent.cli evaluate --experiment models/cpu-audit-v1 --device cpu
+```
+
+## Current v2 offline demo receipt
+
+The default CLI demo now uses `models/initial-v2/` and `runs/demo-v2/` so the
+preserved v1 artifacts cannot be overwritten. The recorded local v2 audit used
+an explicit 256-step override: **3.5950 seconds**, checkpoint
+`models/initial-v2/checkpoints/step-00000256.pt` with SHA-256
+`af252036a16f07d0c5a48b74954f733ebe71f74eb6493e94a3902899a76d5b31`, final
+shadow equity ₹9,698.67, 183 fills, ₹67.88 fees, and a rejected candidate.
+`make demo` subsequently resumed this durable account and verified the pinned
+evaluation receipt without adding fills. This remains synthetic engineering
+evidence, not profitability evidence.
