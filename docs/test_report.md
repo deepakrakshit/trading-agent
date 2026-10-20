@@ -26,7 +26,7 @@ It runs pytest, source/test compilation and `pip check`; it does not download da
 | `.venv-cuda/bin/python -m trading_agent.cli train --device cuda --output models/cuda-verification-only --steps 16` | **Exit 1:** refused CPU fallback for explicit CUDA request; no training run created |
 | Two `apt-get --simulate install` attempts | Failed dependency resolution; no system modification |
 | `docker --version` | Command not found; Docker build/run **not executed** |
-| `git archive HEAD` into a clean temporary checkout + `make test PYTHON=/home/deepakrakshit/trading_agent/.venv-repro/bin/python` | **Pending after the final documentation commit**; the prior pre-run archive passed 249 tests |
+| `git archive HEAD` at `ef19f24` into a clean temporary checkout + `make test PYTHON=/home/deepakrakshit/trading_agent/.venv-repro/bin/python` | **259 passed**; compilation and `pip check` passed; no ignored data/models/runs were present in the source archive |
 | Dedicated linter/typechecker | Not configured/run; compilation is not claimed as static typing or lint coverage |
 
 ## Behaviors covered
