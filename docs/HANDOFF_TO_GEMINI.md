@@ -5,7 +5,7 @@
 - Workspace: `/home/deepakrakshit/trading_agent`
 - Repository: `https://github.com/deepakrakshit/trading-agent.git`
 - Branch: `main`
-- Local revision before this handoff file: `c1895733decf6de16eabd32adfbdf4ba739c28bb`
+- Revision before this handoff file: `c1895733decf6de16eabd32adfbdf4ba739c28bb`
 - Runtime: CPython `3.14.4`, pinned by `.python-version`
 - Date: 20 October 2026
 - Product boundary: **paper trading only**. No real order route, broker order endpoint, credentials, or financial execution exists.
@@ -13,7 +13,7 @@
   - `53dbfb9 feat: add continuous paper replay runner`
   - `ef19f24 docs: record continuous paper handoff`
   - `c189573 docs: record final reproducibility receipt`
-- These local commits still need to be pushed to `origin/main` after this handoff document is committed and verified.
+- The handoff was committed as `1d5517e` and pushed to `origin/main`; verify the remote before starting new work.
 
 ## Executive Summary
 
@@ -504,8 +504,9 @@ clean archive path is shown.
 - Clean source archive at pre-handoff revision `c189573`:
   `git archive HEAD | tar -x -C <tmp>` followed by
   `make -C <tmp> test PYTHON=/home/deepakrakshit/trading_agent/.venv-repro/bin/python`
-  — **259 passed**, compileall and `pip check` passed. Repeat after this file's
-  final commit because the archive revision will change.
+  — **259 passed**, compileall and `pip check` passed.
+- The same clean source-archive check was repeated at handoff commit `1d5517e`
+  and again passed **259 tests**, compilation and `pip check`.
 - Docker build/run — **not run**; `docker --version` is unavailable.
 - Dedicated lint/typecheck — **not configured/not run**.
 
@@ -537,9 +538,8 @@ reported `paper_only: true` and `provenance: SYNTHETIC`.
 
 ## Recommended Next Steps
 
-1. Commit this handoff file, repeat the clean source-archive check against the
-   final HEAD, and push the local commits to `origin/main`. Verify the remote
-   branch and clean Git status.
+1. Verify `git status --short`, `git log --oneline -5`, and that `origin/main`
+   contains `1d5517e` before changing anything.
 2. On Windows, create project-local Python 3.14.4 environments and run the
    full offline suite before attempting any data/GPU work. Treat Windows
    dependency resolution as a separate pinned lockfile task.
@@ -654,8 +654,6 @@ wants only offline replay versus a real read-only live feed. Never guess.
 
 ## Immediate Next Action
 
-Commit this file, rerun the source-archive test against the final HEAD, push the
-local commits to `origin/main`, verify `git status --short` is empty, and then
-hand this document to Gemini Antigravity. The next implementation decision is
-Windows environment verification; no real provider or GPU repair should be
-attempted before that evidence exists.
+Verify that `origin/main` is at `1d5517e` and that the worktree is clean, then
+start Windows environment verification. No real provider or GPU repair should
+be attempted before that evidence exists.
