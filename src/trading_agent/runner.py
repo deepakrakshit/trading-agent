@@ -14,6 +14,7 @@ from .attribution import attribute_round_trips
 from .config import make_env
 from .evaluation import CashBaseline, RuleBaseline, compute_metrics
 from .execution import PaperBroker
+from .experience import build_manifest
 from .learning import DQNTrainer
 from .portfolio import PortfolioLedger
 from .registry import CandidateRegistry
@@ -32,14 +33,38 @@ def open_paper(db: str | Path):
         raise FileNotFoundError("paper account does not exist")
     spec = read_json(spec_path(db))
     data = db.parent / spec["dataset"]
-    bars = load_market(data, spec["config"])[slice(*spec["range"])]
-    if digest([bar.to_mapping() for bar in bars]) != spec["slice_hash"]:
+    expected_manifest = spec.get("snapshot_manifest_sha256")
+    if spec.get("format") == "paper-replay-v2" and not isinstance(expected_manifest, str):
+        raise ValueError("paper replay spec lacks a pinned snapshot manifest")
+    bars = load_market(
+        data,
+        spec["config"],
+        expected_manifest_sha256=expected_manifest,
+    )[slice(*spec["range"])]
+    if spec.get("format") == "paper-replay-v2":
+        probe = make_env(
+            bars,
+            spec["config"],
+            policy_version=spec["policy_version"],
+            source_dataset_hash=spec.get("dataset_hash"),
+        )
+        if probe.dataset_hash != spec["slice_hash"]:
+            raise ValueError("paper replay data changed")
+    elif digest([bar.to_mapping() for bar in bars]) != spec["slice_hash"]:
+        # Explicit legacy read path for preserved v1 artifacts.  The old
+        # checkpoint/account is still rejected later if it lacks v2 metadata.
         raise ValueError("paper replay data changed")
     if spec.get("checkpoint") and file_hash(db.parent / spec["checkpoint"]) != spec["checkpoint_sha256"]:
         raise ValueError("paper policy artifact changed")
     repo = SQLiteRepository(db)
     try:
-        env = make_env(bars, spec["config"], repository=repo, policy_version=spec["policy_version"])
+        env = make_env(
+            bars,
+            spec["config"],
+            repository=repo,
+            policy_version=spec["policy_version"],
+            source_dataset_hash=spec.get("dataset_hash"),
+        )
         observation, info = env.resume()
     except BaseException:
         repo.close()
@@ -67,7 +92,11 @@ def run_paper(experiment: str | Path | None, db: str | Path, *, strategy="active
         manifest = read_json(experiment / "experiment.json")
         config = manifest["config"]
         data = (experiment / manifest["dataset"]).resolve()
-        all_bars = load_market(data, config)
+        all_bars = load_market(
+            data,
+            config,
+            expected_manifest_sha256=manifest.get("snapshot_manifest_sha256"),
+        )
         bounds = manifest["plan"]["test"]
         bars = all_bars[slice(*bounds)]
         checkpoint = None
@@ -95,9 +124,11 @@ def run_paper(experiment: str | Path | None, db: str | Path, *, strategy="active
             raise ValueError("unknown paper strategy")
         db.parent.mkdir(parents=True, exist_ok=True)
         spec = {
-            "format": "paper-replay-v1", "config": config,
+            "format": "paper-replay-v2", "config": config,
             "dataset": os.path.relpath(data, db.parent.resolve()), "range": bounds,
-            "slice_hash": digest([bar.to_mapping() for bar in bars]),
+            "dataset_hash": manifest["dataset_hash"], "instrument": bars[0].symbol,
+            "snapshot_manifest_sha256": manifest.get("snapshot_manifest_sha256"),
+            "slice_hash": None,
             "provenance": manifest["provenance"], "strategy": strategy,
             "shadow": bool(shadow), "policy_version": policy_version,
             "checkpoint": os.path.relpath(checkpoint, db.parent.resolve()) if checkpoint else None,
@@ -105,11 +136,46 @@ def run_paper(experiment: str | Path | None, db: str | Path, *, strategy="active
         }
         save_json(spec_path(db), spec)
         repo = SQLiteRepository(db)
-        env = make_env(bars, config, repository=repo, policy_version=policy_version)
+        env = make_env(
+            bars,
+            config,
+            repository=repo,
+            policy_version=policy_version,
+            source_dataset_hash=manifest["dataset_hash"],
+        )
         observation, info = env.reset(seed=manifest["seed"])
+        spec["slice_hash"] = env.dataset_hash
+        spec["experience"] = build_manifest(
+            dataset_hash=manifest["dataset_hash"],
+            snapshot_manifest_sha256=manifest["snapshot_manifest_sha256"],
+            bar_interval_seconds=int(env.bar_interval.total_seconds()),
+            slice_hash=spec["slice_hash"],
+            source_dataset=spec["dataset"],
+            source_range=bounds,
+            source_start_timestamp=bars[0].timestamp,
+            source_end_timestamp=bars[-1].timestamp,
+            instrument=bars[0].symbol,
+            environment_hash=env.environment_hash,
+            account_config_hash=env.config_hash,
+            experiment_config_hash=digest(config),
+            config_version=env.config_version,
+            feature_version=env.FEATURE_VERSION,
+            feature_schema=env.feature_schema,
+            reward_version=env.REWARD_VERSION,
+            execution_version=PaperBroker.EXECUTION_VERSION,
+            cost_model_version=env.cost_model.version,
+            risk_version=env.risk_limits.version,
+            policy_version=policy_version,
+            episode_id=env.episode_id,
+        )
+        save_json(spec_path(db), spec)
     try:
         if spec["checkpoint"]:
-            policy = DQNTrainer.load_checkpoint(db.parent / spec["checkpoint"], device="cpu")
+            policy = DQNTrainer.load_checkpoint(
+                db.parent / spec["checkpoint"],
+                device="cpu",
+                expected_compatibility=env.checkpoint_compatibility(policy_id=spec["policy_version"]),
+            )
             if policy.metadata.get("config_hash") != digest(spec["config"]):
                 raise ValueError("policy feature/action/cost/risk configuration mismatch")
             action_policy = policy.act
@@ -122,6 +188,8 @@ def run_paper(experiment: str | Path | None, db: str | Path, *, strategy="active
             if max_steps is not None and count >= max_steps:
                 break
             action = action_policy(observation)
+            if not env.action_space.contains(action):
+                raise ValueError("paper policy produced an action outside the account action space")
             observation, _, _, _, info = env.step(action, transition_id=f"paper:{env.current_index}")
             count += 1
         report = paper_report(spec, bars, env)

@@ -30,7 +30,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-from .data import MarketBar, validate_bars
+from .compatibility import COMPATIBILITY_VERSION
+from .data import DataValidationError, MarketBar, validate_bars
 from .data.bars import decimal_value, utc_timestamp
 from .execution import ExecutionReceipt, OrderStatus, PaperBroker, PaperOpenEvent
 from .features import CausalFeatureBuilder
@@ -86,9 +87,14 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
     """
 
     metadata = {"render_modes": []}
+    # Version 2 rejects the earlier cursor shape rather than guessing how an
+    # old done/truncated boundary should be interpreted.  Existing v1 account
+    # files remain untouched and must be explicitly replayed/migrated into a
+    # new account with the current code.
     CHECKPOINT_KEY = "paper_environment_v1"
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
     FEATURE_VERSION = "paper-features-v1"
+    REWARD_VERSION = "log-post-cost-equity-v1"
     feature_schema = (
         "open_to_close", "high_to_close", "low_to_close", "log_return",
         "relative_volume", "cash_fraction", "exposure", "drawdown", "episode_progress",
@@ -115,6 +121,7 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         random_start: bool = False,
         random_start_date: bool = False,
         initial_cash_range: tuple[Decimal | str | float, Decimal | str | float] | None = None,
+        source_dataset_hash: str | None = None,
     ) -> None:
         super().__init__()
         self.bars = validate_bars(bars)
@@ -147,6 +154,15 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
             market_open=time(9, 15), market_close=time(15, 30),
             permitted_symbols=frozenset({self.symbol}),
         )
+        exchange_zone = ZoneInfo(self.risk_limits.session_timezone)
+        for previous, current in zip(self.bars, self.bars[1:]):
+            gap = current.timestamp - previous.timestamp
+            if (
+                previous.timestamp.astimezone(exchange_zone).date()
+                == current.timestamp.astimezone(exchange_zone).date()
+                and gap > bar_interval
+            ):
+                raise DataValidationError("missing or irregular bar inside an exchange session")
         self.repository = repository
         self._policy_version = policy_version.strip()
         self.config_version = config_version.strip()
@@ -177,8 +193,14 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
             if low > high or not all(math.isfinite(float(value)) for value in (low, high)):
                 raise ValueError("initial_cash_range must be ordered, finite positive amounts")
             self.initial_cash_range = (low, high)
+        if source_dataset_hash is not None and (
+            not isinstance(source_dataset_hash, str) or not source_dataset_hash.strip()
+        ):
+            raise ValueError("source_dataset_hash must be a non-empty string when supplied")
+        self.source_dataset_hash = source_dataset_hash.strip() if source_dataset_hash else None
         self.dataset_hash = _hash([bar.to_mapping() for bar in self.bars])
         self.config_hash = _hash(self._configuration())
+        self.environment_hash = _hash(self._environment_configuration())
         self.feature_dim = len(self.feature_schema) - 4
         self.observation_dim = len(self.feature_schema)
         self.n_actions = len(exposures)
@@ -207,6 +229,33 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         """The immutable policy identity attached to every transition."""
 
         return self._policy_version
+
+    @property
+    def episode_id(self) -> str:
+        """The current durable/ephemeral episode identity, if reset has run."""
+
+        return self._episode_id
+
+    def checkpoint_compatibility(self, *, policy_id: str | None = None) -> dict[str, Any]:
+        """Return the semantic contract required by a learned checkpoint."""
+
+        return {
+            "compatibility_version": COMPATIBILITY_VERSION,
+            "config_version": self.config_version,
+            "observation_dim": self.observation_dim,
+            "n_actions": self.n_actions,
+            "feature_schema": list(self.feature_schema),
+            "feature_version": self.FEATURE_VERSION,
+            "target_exposures": list(self.target_exposures),
+            "reward_version": self.REWARD_VERSION,
+            "execution_version": PaperBroker.EXECUTION_VERSION,
+            "bar_interval_seconds": int(self.bar_interval.total_seconds()),
+            "cost_model_version": self.cost_model.version,
+            "risk_version": self.risk_limits.version,
+            "environment_config_hash": self.environment_hash,
+            "instrument": self.symbol,
+            "policy_id": policy_id or self.policy_version,
+        }
 
     @property
     def broker(self) -> PaperBroker:
@@ -292,6 +341,7 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                     PortfolioLedger(capital), cost_model=self.cost_model,
                     risk_supervisor=RiskSupervisor(self.risk_limits),
                     repository=self.repository, participation_limit=self.participation_limit,
+                    bar_interval=self.bar_interval,
                 )
                 self.broker.observe_bar(self.bars[start])
                 self._last_info = self._info()
@@ -323,6 +373,7 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                 PortfolioLedger(0), cost_model=self.cost_model,
                 risk_supervisor=RiskSupervisor(self.risk_limits),
                 repository=self.repository, participation_limit=self.participation_limit,
+                bar_interval=self.bar_interval,
             )
             if broker.revision != state["broker_revision"]:
                 raise PersistenceError("broker and environment cursor revisions do not agree")
@@ -366,9 +417,13 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         current, following = self.bars[self._index], self.bars[self._index + 1]
         if following.timestamp < current.timestamp + self.bar_interval:
             raise ValueError("next open precedes completion of the decision candle")
-        clock = utc_timestamp(as_of) if as_of is not None else following.timestamp
-        if clock < following.timestamp:
-            raise ValueError("step clock cannot precede the eligible next-open event")
+        reward_available_at = following.timestamp + self.bar_interval
+        clock = utc_timestamp(as_of) if as_of is not None else reward_available_at
+        if clock < reward_available_at:
+            raise ValueError("step clock cannot precede completed next-bar reward availability")
+        previous_clock = self._last_info.get("as_of")
+        if previous_clock is not None and clock < utc_timestamp(previous_clock):
+            raise ValueError("step clock cannot move backwards")
         identifier = transition_id or f"{self._episode_id}:{self._index}"
         before_cursor = self._cursor()
         observation = self._observation()
@@ -402,8 +457,15 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                 after = self.ledger.snapshot()
                 invalid_equity = previous.equity <= 0 or after.equity <= 0
                 reward = -1.0 if invalid_equity else math.log(float(after.equity / previous.equity))
-                terminated = invalid_equity or self._index == len(self.bars) - 1
-                truncated = not terminated and self._index >= self.end_index
+                # A configured episode horizon is a task-defined terminal
+                # state, not a Gym time-limit continuation.  The account is
+                # reset with fresh capital after this transition, and the
+                # default terminal closeout is included in its reward.  Marking
+                # it terminated prevents DQN from bootstrapping through a
+                # liquidation that will not be present in the next episode.
+                horizon_end = self._index >= self.end_index
+                terminated = invalid_equity or horizon_end
+                truncated = False
                 self._done = terminated or truncated
                 fills = [receipt.fill for receipt in receipts if receipt.fill is not None]
                 closed_pnls: list[float] = []
@@ -420,7 +482,8 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                     transition_id=identifier, decision_index=self._index - 1,
                     decision_timestamp=current.timestamp, fill_index=self._index,
                     decision_available_at=current.timestamp + self.bar_interval,
-                    reward_available_at=following.timestamp + self.bar_interval,
+                    reward_available_at=reward_available_at,
+                    as_of=clock,
                     fill_timestamp=following.timestamp, fill_open=float(following.open),
                     previous_equity=float(previous.equity),
                     realized_fees=float(sum((fill.fees for fill in fills), Decimal("0"))),
@@ -435,14 +498,27 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
                     terminal_liquidation=terminal_exit, session_liquidation=session_exit,
                     liquidation_unfilled=bool((terminal_exit or session_exit) and self.shares),
                     closed_trade_pnls=closed_pnls, invalid_equity=invalid_equity,
+                    episode_horizon_end=bool(horizon_end),
+                    termination_reason=(
+                        "invalid_equity" if invalid_equity
+                        else "dataset_end" if self._index == len(self.bars) - 1
+                        else "episode_horizon" if horizon_end
+                        else None
+                    ),
                     terminated=bool(terminated), truncated=bool(truncated),
                 )
                 self._last_info = info
                 record = {
                     "transition_id": identifier, "episode_id": self._episode_id,
                     "dataset_hash": self.dataset_hash, "config_hash": self.config_hash,
+                    "source_dataset_hash": self.source_dataset_hash,
+                    "environment_hash": self.environment_hash, "instrument": self.symbol,
                     "policy_version": self.policy_version, "config_version": self.config_version,
                     "feature_version": self.FEATURE_VERSION, "feature_schema": self.feature_schema,
+                    "reward_version": self.REWARD_VERSION,
+                    "execution_version": PaperBroker.EXECUTION_VERSION,
+                    "cost_model_version": self.cost_model.version,
+                    "risk_version": self.risk_limits.version,
                     "index": self._index - 1, "next_index": self._index,
                     "timestamp": following.timestamp.isoformat(), "as_of": clock.isoformat(),
                     "observation": observation.tolist(), "action": action, "reward": float(reward),
@@ -580,8 +656,13 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
             "high_water_mark": float(snapshot.high_water_mark), "drawdown": float(snapshot.drawdown),
             "exposure": float(exposure), "realized_fees": 0.0, "turnover": 0.0,
             "policy_version": self.policy_version, "config_version": self.config_version,
-            "dataset_hash": self.dataset_hash, "episode_id": self._episode_id,
-            "feature_schema": list(self.feature_schema), "fees_paid_total": float(snapshot.fees_paid),
+            "dataset_hash": self.dataset_hash, "source_dataset_hash": self.source_dataset_hash,
+            "environment_hash": self.environment_hash, "instrument": self.symbol,
+            "episode_id": self._episode_id, "feature_version": self.FEATURE_VERSION,
+            "feature_schema": list(self.feature_schema), "reward_version": self.REWARD_VERSION,
+            "execution_version": PaperBroker.EXECUTION_VERSION,
+            "cost_model_version": self.cost_model.version, "risk_version": self.risk_limits.version,
+            "fees_paid_total": float(snapshot.fees_paid),
             **extra,
         }
 
@@ -609,23 +690,37 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
 
     def _configuration(self) -> dict[str, Any]:
         return {
+            **self._environment_configuration(),
+            "policy_version": self.policy_version,
+            "initial_cash": self.initial_cash,
+            "source_dataset_hash": self.source_dataset_hash,
+            "start_index": self._configured_start,
+            "episode_length": self.episode_length,
+            "random_start": self.random_start,
+            "random_start_date": self.random_start_date,
+            "initial_cash_range": self.initial_cash_range,
+        }
+
+    def _environment_configuration(self) -> dict[str, Any]:
+        """Return policy-independent financial/observation semantics."""
+
+        return {
             "format": self.FORMAT_VERSION, "config_version": self.config_version,
-            "policy_version": self.policy_version, "feature_version": self.FEATURE_VERSION,
+            "feature_version": self.FEATURE_VERSION, "reward_version": self.REWARD_VERSION,
             "feature_schema": self.feature_schema, "feature_lookback": self.feature_lookback,
             "cost_model": asdict(self.cost_model), "risk_limits": asdict(self.risk_limits),
             "execution_version": PaperBroker.EXECUTION_VERSION,
             "target_exposures": self.target_exposures, "participation_limit": self.participation_limit,
             "terminal_liquidation": self.terminal_liquidation, "session_liquidation": self.session_liquidation,
-            "bar_interval": self.bar_interval, "initial_cash": self.initial_cash,
-            "start_index": self._configured_start, "episode_length": self.episode_length,
-            "random_start": self.random_start, "random_start_date": self.random_start_date,
-            "initial_cash_range": self.initial_cash_range,
+            "bar_interval": self.bar_interval, "instrument": self.symbol,
         }
 
     def _cursor(self) -> dict[str, Any]:
         return {
             "format": self.FORMAT_VERSION, "dataset_hash": self.dataset_hash,
             "config_hash": self.config_hash, "policy_version": self.policy_version,
+            "environment_hash": self.environment_hash, "instrument": self.symbol,
+            "source_dataset_hash": self.source_dataset_hash,
             "config_version": self.config_version, "episode_id": self._episode_id,
             "history_hash": self._history_hash,
             "start_index": self.start_index, "end_index": self.end_index,
@@ -656,17 +751,119 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         self._np_random_seed = state["rng_seed"]
 
     def _validate_checkpoint(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise PersistenceError("paper environment checkpoint is not a mapping")
+        required = {
+            "format", "dataset_hash", "config_hash", "policy_version", "config_version",
+            "environment_hash", "instrument", "source_dataset_hash", "episode_id",
+            "history_hash", "start_index", "end_index", "index", "steps", "done",
+            "initial_cash", "episode_options", "position_pnl_start", "last_info",
+            "rng_state", "rng_seed", "broker_revision", "ledger_hash",
+        }
+        missing = sorted(required - set(state))
+        if missing:
+            raise PersistenceError(f"paper environment checkpoint is missing fields: {', '.join(missing)}")
+
         for key, expected in (
             ("format", self.FORMAT_VERSION), ("dataset_hash", self.dataset_hash),
             ("policy_version", self.policy_version), ("config_version", self.config_version),
-            ("config_hash", self.config_hash),
+            ("config_hash", self.config_hash), ("environment_hash", self.environment_hash),
+            ("instrument", self.symbol), ("source_dataset_hash", self.source_dataset_hash),
         ):
             if state.get(key) != expected:
                 raise ValueError(f"paper environment checkpoint {key} mismatch")
-        if not 0 <= state["start_index"] <= state["index"] <= state["end_index"] < len(self.bars):
+
+        integer_fields = ("start_index", "end_index", "index", "steps", "broker_revision")
+        for key in integer_fields:
+            value = state[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PersistenceError(f"persisted checkpoint field {key} is not a valid non-negative integer")
+        if not isinstance(state["done"], bool):
+            raise PersistenceError("persisted checkpoint done flag is not boolean")
+        if not isinstance(state["episode_id"], str) or not state["episode_id"].strip():
+            raise PersistenceError("persisted checkpoint episode_id is invalid")
+        if not isinstance(state["history_hash"], str) or not state["history_hash"].strip():
+            raise PersistenceError("persisted checkpoint history_hash is invalid")
+        if not isinstance(state["ledger_hash"], str) or not state["ledger_hash"].strip():
+            raise PersistenceError("persisted checkpoint ledger_hash is invalid")
+        if state["source_dataset_hash"] is not None and (
+            not isinstance(state["source_dataset_hash"], str) or not state["source_dataset_hash"].strip()
+        ):
+            raise PersistenceError("persisted source_dataset_hash is invalid")
+        if state["rng_seed"] is not None and (
+            isinstance(state["rng_seed"], bool) or not isinstance(state["rng_seed"], int)
+        ):
+            raise PersistenceError("persisted rng_seed is invalid")
+
+        try:
+            cash = _positive_cash(state["initial_cash"])
+            position_pnl_start = decimal_value(state["position_pnl_start"], "position_pnl_start")
+        except (ValueError, ArithmeticError) as exc:
+            raise PersistenceError("persisted checkpoint monetary state is invalid") from exc
+        if position_pnl_start.is_nan() or not position_pnl_start.is_finite():
+            raise PersistenceError("persisted position_pnl_start is not finite")
+
+        start, end, index = state["start_index"], state["end_index"], state["index"]
+        if not 0 <= start < end < len(self.bars) or not start <= index <= end:
             raise PersistenceError("persisted cursor is outside its episode/data bounds")
-        if state["steps"] != state["index"] - state["start_index"]:
+        if state["steps"] != index - start:
             raise PersistenceError("persisted transition count and cursor do not agree")
+        options = state["episode_options"]
+        if not isinstance(options, Mapping):
+            raise PersistenceError("persisted episode_options is not a mapping")
+        if (
+            options.get("start_index") != start
+            or options.get("end_index") != end
+            or options.get("initial_cash") != str(cash)
+            or "seed" not in options
+        ):
+            raise PersistenceError("persisted episode options do not match the cursor")
+
+        last_info = state["last_info"]
+        if (
+            not isinstance(last_info, Mapping)
+            or isinstance(last_info.get("index"), bool)
+            or not isinstance(last_info.get("index"), int)
+            or last_info.get("index") != index
+        ):
+            raise PersistenceError("persisted last_info does not identify the cursor index")
+        if state["steps"] and (
+            not isinstance(last_info.get("as_of"), str)
+            or utc_timestamp(datetime.fromisoformat(last_info["as_of"])) <
+            self.bars[index].timestamp + self.bar_interval
+        ):
+            raise PersistenceError("persisted last_info has an unavailable or missing execution clock")
+        if last_info.get("episode_id") not in (None, state["episode_id"]):
+            raise PersistenceError("persisted last_info episode identity does not match the cursor")
+        if index == end and not state["done"]:
+            raise PersistenceError("cursor at episode end is not marked done")
+        if state["done"] and state["steps"] == 0:
+            raise PersistenceError("fresh episode cursor cannot be marked done")
+        if state["done"] and state["steps"] and last_info.get("terminated") is not True:
+            raise PersistenceError("done cursor is missing a terminal transition")
+        if last_info.get("terminated") is not None and not isinstance(last_info["terminated"], bool):
+            raise PersistenceError("persisted terminated flag is not boolean")
+        if last_info.get("truncated") is not None and last_info.get("truncated") is not False:
+            raise PersistenceError("canonical paper environment does not persist truncated transitions")
+        if last_info.get("terminated") is not None and last_info.get("terminated") != state["done"]:
+            raise PersistenceError("last_info termination flag disagrees with cursor done state")
+
+        if not isinstance(state["rng_state"], Mapping):
+            raise PersistenceError("persisted RNG state is not a mapping")
+        try:
+            probe = np.random.default_rng()
+            probe.bit_generator.state = deepcopy(state["rng_state"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise PersistenceError("persisted RNG state is invalid") from exc
+
+        if self.repository is not None:
+            broker_state = self.repository.load_state(PaperBroker.STATE_KEY)
+            if not isinstance(broker_state, Mapping):
+                raise PersistenceError("paper environment cursor has no broker checkpoint")
+            if broker_state.get("sequence") != state["broker_revision"]:
+                raise PersistenceError("paper broker and environment revisions do not agree")
+            if _hash(broker_state.get("ledger")) != state["ledger_hash"]:
+                raise PersistenceError("paper broker and environment ledger hashes do not agree")
 
     def _assert_current_cursor(self) -> None:
         if self.repository:
@@ -679,15 +876,92 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
         if len(records) != self._steps:
             raise PersistenceError("saved transition history does not match the cursor count")
         digest = _hash({"episode": self._episode_id})
+        previous_timestamp = None
+        previous_as_of = None
         for offset, record in enumerate(records):
             expected_index = self.start_index + offset
-            if record["index"] != expected_index or record["next_index"] != expected_index + 1:
+            if not isinstance(record, Mapping):
+                raise PersistenceError("saved transition history contains a non-mapping record")
+            if record.get("episode_id") != self._episode_id:
+                raise PersistenceError("saved transition has the wrong episode identity")
+            if (
+                isinstance(record.get("index"), bool)
+                or not isinstance(record.get("index"), int)
+                or isinstance(record.get("next_index"), bool)
+                or not isinstance(record.get("next_index"), int)
+                or record.get("index") != expected_index
+                or record.get("next_index") != expected_index + 1
+                or record.get("next_index") >= len(self.bars)
+            ):
                 raise PersistenceError("saved transition history is not a contiguous causal path")
+            if record.get("dataset_hash") != self.dataset_hash:
+                raise PersistenceError("saved transition dataset hash does not match the environment")
+            if record.get("source_dataset_hash") != self.source_dataset_hash:
+                raise PersistenceError("saved transition source dataset hash does not match the environment")
+            if record.get("environment_hash") != self.environment_hash:
+                raise PersistenceError("saved transition environment hash does not match the environment")
+            if record.get("instrument") != self.symbol:
+                raise PersistenceError("saved transition instrument does not match the environment")
+            if record.get("feature_version") != self.FEATURE_VERSION or tuple(record.get("feature_schema", ())) != self.feature_schema:
+                raise PersistenceError("saved transition feature contract does not match the environment")
+            if record.get("reward_version") != self.REWARD_VERSION:
+                raise PersistenceError("saved transition reward version does not match the environment")
+            if record.get("execution_version") != PaperBroker.EXECUTION_VERSION:
+                raise PersistenceError("saved transition execution version does not match the environment")
+            if record.get("cost_model_version") != self.cost_model.version or record.get("risk_version") != self.risk_limits.version:
+                raise PersistenceError("saved transition cost/risk version does not match the environment")
+            if isinstance(record.get("action"), bool) or not isinstance(record.get("action"), int) or not self.action_space.contains(record["action"]):
+                raise PersistenceError("saved transition contains an invalid action")
+            if not isinstance(record.get("terminated"), bool) or not isinstance(record.get("truncated"), bool) or record["terminated"] and record["truncated"]:
+                raise PersistenceError("saved transition termination flags are invalid")
+            if record["truncated"]:
+                raise PersistenceError("canonical paper environment cannot persist a truncated transition")
+            try:
+                timestamp = datetime.fromisoformat(record["timestamp"])
+                as_of = datetime.fromisoformat(record["as_of"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PersistenceError("saved transition timestamps are invalid") from exc
+            expected_completion = self.bars[record["next_index"]].timestamp + self.bar_interval
+            if timestamp != self.bars[record["next_index"]].timestamp or utc_timestamp(as_of) < expected_completion:
+                raise PersistenceError("saved transition timestamp boundary is not causal")
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise PersistenceError("saved transition timestamps are not strictly chronological")
+            if previous_as_of is not None and utc_timestamp(as_of) < previous_as_of:
+                raise PersistenceError("saved transition execution clocks are not monotonic")
+            previous_timestamp = timestamp
+            previous_as_of = utc_timestamp(as_of)
+            info = record.get("info")
+            info_as_of = info.get("as_of") if isinstance(info, Mapping) else None
+            try:
+                info_as_of = datetime.fromisoformat(info_as_of) if isinstance(info_as_of, str) else info_as_of
+            except ValueError as exc:
+                raise PersistenceError("saved transition info has an invalid execution clock") from exc
+            if (
+                not isinstance(info, Mapping)
+                or info.get("index") != record["next_index"]
+                or info.get("transition_id") != record.get("transition_id")
+                or not isinstance(info_as_of, datetime)
+                or utc_timestamp(info_as_of) != utc_timestamp(as_of)
+            ):
+                raise PersistenceError("saved transition info does not match its record")
+            if info.get("terminated") != record["terminated"] or info.get("truncated") != record["truncated"]:
+                raise PersistenceError("saved transition info termination flags disagree with its record")
+            try:
+                Transition(
+                    tuple(record["observation"]), record["action"], record["reward"],
+                    tuple(record["next_observation"]), record["terminated"], record["truncated"],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PersistenceError("saved transition numerical payload is invalid") from exc
             digest = _hash({"previous": digest, "transition": record})
         if digest != self._history_hash:
             raise PersistenceError("saved transition history digest does not match the checkpoint")
         if records and records[-1]["transition_id"] != self._last_info.get("transition_id"):
             raise PersistenceError("saved cursor does not identify its last transition")
+        if not records and self._last_info.get("transition_id") is not None:
+            raise PersistenceError("empty transition history has a last transition ID")
+        if records and self._done != records[-1]["terminated"]:
+            raise PersistenceError("saved cursor done state disagrees with its last transition")
 
     def _find_transition(self, identifier: str) -> dict[str, Any] | None:
         if self.repository:
@@ -702,7 +976,10 @@ class PaperTradingEnv(gym.Env[np.ndarray, int]):
     @staticmethod
     def _restore_info(payload: Mapping[str, Any]) -> dict[str, Any]:
         result = deepcopy(dict(payload))
-        for name in ("timestamp", "decision_timestamp", "fill_timestamp", "decision_available_at", "reward_available_at"):
+        for name in (
+            "timestamp", "decision_timestamp", "fill_timestamp", "decision_available_at",
+            "reward_available_at", "as_of",
+        ):
             if isinstance(result.get(name), str):
                 result[name] = datetime.fromisoformat(result[name])
         return result

@@ -6,6 +6,7 @@ import random
 import pytest
 
 from trading_agent.learning import DQNConfig, DQNTrainer, ReplayBuffer, Transition
+from trading_agent.compatibility import CheckpointCompatibilityError
 
 
 def transition(index):
@@ -79,6 +80,39 @@ def test_checkpoint_restores_weights_optimizer_replay_rng_and_next_updates(tmp_p
         assert torch.equal(value, restored.target.state_dict()[key])
 
 
+def test_checkpoint_semantic_compatibility_requires_schema_actions_and_versions(tmp_path):
+    pytest.importorskip("torch")
+    compatibility = {
+        "compatibility_version": "paper-compat-v1",
+        "config_version": "research-v1",
+        "observation_dim": 2,
+        "n_actions": 2,
+        "feature_schema": ["x", "cash"],
+        "feature_version": "features-v1",
+        "target_exposures": [0.0, 1.0],
+        "reward_version": "log-post-cost-equity-v1",
+        "execution_version": "causal-open-v2",
+        "bar_interval_seconds": 300,
+        "cost_model_version": "cost-v1",
+        "risk_version": "risk-v1",
+        "environment_config_hash": "env-hash",
+        "instrument": "ABC",
+        "policy_id": "candidate-v1",
+    }
+    trainer = DQNTrainer(config(), metadata={"checkpoint_compatibility": compatibility})
+    path = trainer.save_checkpoint(tmp_path / "semantic.pt")
+    assert DQNTrainer.load_checkpoint(path, expected_compatibility=compatibility).config == trainer.config
+    for field, value in (("feature_schema", ["cash", "x"]), ("target_exposures", [0.0, 0.5]), ("execution_version", "other")):
+        incompatible = dict(compatibility)
+        incompatible[field] = value
+        with pytest.raises(CheckpointCompatibilityError, match="compatibility mismatch"):
+            DQNTrainer.load_checkpoint(path, expected_compatibility=incompatible)
+    bare = DQNTrainer(config())
+    bare_path = bare.save_checkpoint(tmp_path / "bare.pt")
+    with pytest.raises(CheckpointCompatibilityError, match="missing required checkpoint_compatibility"):
+        DQNTrainer.load_checkpoint(bare_path, expected_compatibility=compatibility)
+
+
 def test_same_seed_independent_trainers_and_global_rng_isolation():
     torch = pytest.importorskip("torch")
     python_state = random.getstate()
@@ -149,6 +183,10 @@ def test_rejects_nonfinite_transition_and_bad_checkpoint(tmp_path):
     torch.save({"format": "other", "version": 1}, path)
     with pytest.raises(ValueError, match="format"):
         DQNTrainer.load_checkpoint(path)
+    legacy = tmp_path / "legacy.pt"
+    torch.save({"format": "trading-agent-dqn", "version": 1}, legacy)
+    with pytest.raises(ValueError, match="legacy checkpoints"):
+        DQNTrainer.load_checkpoint(legacy)
 
 
 def test_offline_train_restore_evaluate_and_stage_without_safety_receipts(tmp_path):

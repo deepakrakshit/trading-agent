@@ -27,6 +27,13 @@ import random
 import tempfile
 from typing import Any, Protocol
 
+from .compatibility import (
+    CHECKPOINT_FORMAT,
+    CHECKPOINT_VERSION as CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
+    validate_checkpoint_compatibility,
+)
+
 
 class TorchDependencyError(ImportError):
     """Raised when training is requested without a usable PyTorch install."""
@@ -181,7 +188,7 @@ class TrainingEnvironment(Protocol):
 class DQNTrainer:
     """Compact MLP DQN; Double-DQN is the default target estimator."""
 
-    CHECKPOINT_VERSION = 1
+    CHECKPOINT_VERSION = CHECKPOINT_SCHEMA_VERSION
 
     def __init__(self, config: DQNConfig, *, metadata: Mapping[str, Any] | None = None) -> None:
         self.config = config
@@ -329,7 +336,7 @@ class DQNTrainer:
         if not path.parent.is_dir():
             raise FileNotFoundError(f"checkpoint directory does not exist: {path.parent}")
         payload = {
-            "format": "trading-agent-dqn", "version": self.CHECKPOINT_VERSION,
+            "format": CHECKPOINT_FORMAT, "version": self.CHECKPOINT_VERSION,
             "config": asdict(self.config), "metadata": self.metadata,
             "torch_version": str(self.torch.__version__),
             "online": self.online.state_dict(), "target": self.target.state_dict(),
@@ -351,11 +358,30 @@ class DQNTrainer:
         return path
 
     @classmethod
-    def load_checkpoint(cls, path: str | Path, *, device: str = "cpu") -> DQNTrainer:
+    def load_checkpoint(
+        cls,
+        path: str | Path,
+        *,
+        device: str = "cpu",
+        expected_compatibility: Mapping[str, Any] | None = None,
+    ) -> DQNTrainer:
         torch = _torch()
         state = torch.load(Path(path), map_location=device, weights_only=True)
-        if state.get("format") != "trading-agent-dqn" or state.get("version") != cls.CHECKPOINT_VERSION:
-            raise ValueError("unsupported DQN checkpoint format/version")
+        if state.get("format") != CHECKPOINT_FORMAT:
+            raise ValueError("unsupported DQN checkpoint format")
+        if state.get("version") != cls.CHECKPOINT_VERSION:
+            raise ValueError(
+                "unsupported DQN checkpoint version; legacy checkpoints require explicit migration/retraining"
+            )
+        if not isinstance(state.get("metadata"), Mapping):
+            raise ValueError("DQN checkpoint metadata is missing or invalid")
+        if expected_compatibility is not None:
+            try:
+                validate_checkpoint_compatibility(
+                    state["metadata"], expected_compatibility, context=str(path)
+                )
+            except CheckpointCompatibilityError:
+                raise
         config = dict(state["config"])
         config["device"] = device
         result = cls(DQNConfig(**config), metadata=state["metadata"])

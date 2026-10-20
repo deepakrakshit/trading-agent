@@ -52,6 +52,7 @@ def test_fees_slippage_rewards_and_terminal_liquidation_use_one_canonical_ledger
     _, reward, terminated, truncated, last = env.step(1)
     rewards.append(reward)
     assert terminated and not truncated and last["terminal_liquidation"]
+    assert last["termination_reason"] == "dataset_end" and last["episode_horizon_end"]
     assert last["sell_price"] == 108.9 and last["shares"] == 0
     assert last["equity"] == 1052.21 and env.ledger.cash == Decimal("1052.21")
     assert env.ledger.fees_paid == Decimal("18.89")
@@ -73,6 +74,16 @@ def test_next_open_gap_is_real_and_open_fill_does_not_see_future_volume():
         assert info["buy_price"] == 120 and info["shares"] == 8
     assert np.array_equal(outputs[0][0], outputs[1][0])
     assert outputs[0][1:] == outputs[1][1:]
+
+
+def test_explicit_clock_cannot_read_next_bar_before_close_or_move_backwards():
+    env = PaperTradingEnv(candles((100, 101, 102, 103)), risk_limits=RESEARCH_LIMITS, terminal_liquidation=False)
+    env.reset()
+    with pytest.raises(ValueError, match="reward availability"):
+        env.step(0, as_of=candles()[1].timestamp)
+    env.step(0, as_of=START + timedelta(hours=1))
+    with pytest.raises(ValueError, match="move backwards"):
+        env.step(0, as_of=START + timedelta(minutes=20))
 
 
 @pytest.mark.parametrize("kind", ["kill", "stale", "size", "exposure", "hours"])
@@ -136,10 +147,65 @@ def test_short_training_window_truncates_and_expensive_share_is_valid_no_trade()
     env = PaperTradingEnv(candles(), initial_cash=10, episode_length=1)
     env.reset(seed=1)
     _, reward, terminated, truncated, info = env.step(4)
-    assert not terminated and truncated and reward == 0
+    # episode_length is a task-defined terminal horizon.  It is not a
+    # continuation/time-limit truncation because the next reset gets a fresh
+    # account; the DQN must mask this transition.
+    assert terminated and not truncated and reward == 0
+    assert info["episode_horizon_end"] and info["termination_reason"] == "episode_horizon"
     assert info["shares"] == 0 and info["cash"] == 10 and not info["fills"]
     with pytest.raises(RuntimeError, match="episode ended"):
         env.step(0)
+
+
+def test_artificial_horizon_liquidates_open_position_and_closes_account():
+    env = PaperTradingEnv(
+        candles((100, 100, 110, 120)),
+        initial_cash=1000,
+        episode_length=2,
+        target_exposures=(0, 1),
+        risk_limits=RESEARCH_LIMITS,
+        cost_model=CostModel(brokerage_rate="0.01", slippage_bps=100),
+    )
+    env.reset(seed=5)
+    _, first_reward, first_terminated, first_truncated, first = env.step(1)
+    assert not first_terminated and not first_truncated
+    assert first["shares"] > 0 and first["cash"] < 1000
+    _, final_reward, terminated, truncated, final = env.step(1)
+    assert terminated and not truncated
+    assert final["episode_horizon_end"] and final["termination_reason"] == "episode_horizon"
+    assert final["terminal_liquidation"] and final["shares"] == 0
+    assert final["cash"] == final["equity"]
+    assert final["realized_fees"] > 0 and final["closed_trade_pnls"]
+    assert float(env.ledger.realized_pnl) == pytest.approx(final["closed_trade_pnls"][0])
+    assert env.ledger.snapshot().unrealized_pnl == 0
+    assert first_reward + final_reward == pytest.approx(math.log(final["equity"] / 1000))
+
+
+def test_artificial_horizon_is_masked_as_terminal_for_dqn_targets():
+    torch = pytest.importorskip("torch")
+    from trading_agent.learning import DQNConfig, DQNTrainer
+
+    env = PaperTradingEnv(candles(), initial_cash=10, episode_length=1, risk_limits=RESEARCH_LIMITS)
+    observation, _ = env.reset(seed=2)
+    next_observation, reward, terminated, truncated, _ = env.step(0)
+    trainer = DQNTrainer(DQNConfig(
+        observation_dim=env.observation_dim,
+        n_actions=env.n_actions,
+        hidden_sizes=(),
+        batch_size=1,
+        learning_starts=1,
+        replay_capacity=2,
+        gamma=0.5,
+    ))
+    with torch.no_grad():
+        trainer.online[0].bias.zero_()
+        trainer.target[0].bias.fill_(2.0)
+    targets = trainer._targets(
+        torch.tensor([reward]),
+        torch.tensor(np.asarray([next_observation])),
+        torch.tensor([float(terminated or (truncated and not trainer.config.bootstrap_truncated))]),
+    )
+    assert terminated and not truncated and targets.item() == pytest.approx(reward)
 
 
 def test_observation_schema_matches_evaluation_baselines_and_gym_checker():

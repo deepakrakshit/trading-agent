@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
+import warnings
 from typing import Any, Protocol, runtime_checkable
 
 try:  # Gymnasium is an optional runtime dependency for source-only installs.
@@ -462,7 +463,24 @@ class SingleInstrumentTradingEnv(_EnvBase):
         return None
 
 
-TradingEnv = SingleInstrumentTradingEnv
+class TradingEnv(SingleInstrumentTradingEnv):
+    """Deprecated compatibility environment.
+
+    The supported financial simulation is
+    :class:`trading_agent.paper_env.PaperTradingEnv`, which uses the canonical
+    Decimal ledger, broker, risk supervisor, persistence, and task-specific
+    termination contract.  This small injected-execution environment remains
+    available only for backwards-compatible primitive/causality tests.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        warnings.warn(
+            "trading_agent.env.TradingEnv is a compatibility fixture; use "
+            "trading_agent.paper_env.PaperTradingEnv for financial training/evaluation",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
 
 
 __all__ = [

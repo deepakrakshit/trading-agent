@@ -455,6 +455,15 @@ Suggested persistence:
 
 A model file by itself is not reproducible. The exact feature code, data version, action mapping, reward formula, fees and execution engine version must also be known.
 
+The current implementation makes this boundary explicit: supported learned
+checkpoints use a versioned semantic compatibility contract (ordered feature
+schema, exact target-exposure mapping, reward/execution/cost/risk versions,
+environment hash, instrument, config version and policy identity). Paper
+experience uses a separate source manifest and tamper-evident transition
+history. A later dataset may import an earlier verified source, but matching a
+surface-level JSON configuration is not sufficient. See
+`docs/t1_hardening.md` for the implemented v2 checkpoint and migration policy.
+
 ## 11. Tests before trusting the P&L
 
 Build deterministic unit tests for:
@@ -703,6 +712,13 @@ All portfolio-changing actions must terminate at the deterministic **paper broke
 - Enforce independent exposure, cash, per-symbol, turnover/trade-frequency, stale-feed, daily-loss, drawdown and market-hours guards. The learned model cannot edit the limits or disable the kill switch.
 - Train on historical episodes; reserve chronological validation/test windows and then run rolling/expanding walk-forward evaluation. Fit scalers only on training data. Include cash/no-trade, random sanity, and simple rule baselines. Evaluate net of costs, multiple seeds and unseen windows; report drawdown and uncertainty as well as return. Never tune repeatedly on the final test window.
 - Store candidates separately from the active paper policy. Promote only through predetermined measurable checks and a logged report; keep the incumbent if a candidate fails. No auto-promotion based on one green run or one good day.
+- Treat an artificial training horizon as a task-defined terminal boundary when
+  it liquidates/reset the account; do not bootstrap through that liquidation.
+  Reserve `truncated` for a caller-imposed collection cutoff that genuinely
+  represents continuation of the same underlying task.
+- Require versioned independent accounting, data-integrity, risk, shadow and
+  recovery receipts at promotion. Missing receipts remain false/unknown and
+  cannot be enabled away by a configuration switch.
 
 ### Minimum test/acceptance matrix
 

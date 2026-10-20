@@ -23,6 +23,12 @@ from .config import make_env
 from .data import CSVBarProvider, DataValidationError, MarketBar
 from .data.calendar import KOLKATA, FIVE_MINUTES, SessionCalendar
 from .data.persistence import load_snapshot, write_snapshot
+from .experience import (
+    ExperienceProvenanceError,
+    history_digest,
+    validate_manifest,
+    validate_rows,
+)
 from .evaluation import (
     CashBaseline, PerformanceMetrics, chronological_splits, compute_metrics,
     evaluate_baselines, evaluate_policy,
@@ -32,6 +38,7 @@ from .registry import (
     CandidateRegistry, EvaluationSummary, EvaluationWindow, PromotionEvidence, PromotionGates,
 )
 from .storage import SQLiteRepository
+from .paper_env import PaperTradingEnv
 
 
 def jsonable(value: Any) -> Any:
@@ -78,6 +85,40 @@ def file_hash(path: str | Path) -> str:
     return hasher.hexdigest()
 
 
+def receipt_hash_path(path: str | Path) -> Path:
+    """Return the sidecar path for a consumed immutable JSON receipt."""
+
+    path = Path(path)
+    return path.with_name(path.name + ".sha256.json")
+
+
+def write_receipt_hash(path: str | Path) -> None:
+    """Publish a hash after the receipt itself has been durably written."""
+
+    path = Path(path)
+    save_json(receipt_hash_path(path), {
+        "format": "sha256-receipt-v1",
+        "file": path.name,
+        "sha256": file_hash(path),
+    })
+
+
+def verify_receipt_hash(path: str | Path) -> None:
+    """Fail closed when a consumed receipt is missing or changed."""
+
+    path = Path(path)
+    sidecar = receipt_hash_path(path)
+    if not sidecar.is_file():
+        raise ValueError(f"immutable evaluation receipt hash is missing: {sidecar}")
+    receipt = read_json(sidecar)
+    if (
+        receipt.get("format") != "sha256-receipt-v1"
+        or receipt.get("file") != path.name
+        or receipt.get("sha256") != file_hash(path)
+    ):
+        raise ValueError(f"immutable evaluation receipt hash mismatch: {path}")
+
+
 def code_revision() -> str:
     try:
         result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False)
@@ -122,13 +163,27 @@ def generate_synthetic(path: str | Path, *, sessions=24, seed=2026) -> dict:
     return manifest.to_mapping()
 
 
-def load_market(path: str | Path, config: Mapping[str, Any]) -> tuple[MarketBar, ...]:
-    snapshot = load_snapshot(path)
+def load_market(
+    path: str | Path,
+    config: Mapping[str, Any],
+    *,
+    expected_manifest_sha256: str | None = None,
+) -> tuple[MarketBar, ...]:
+    snapshot = load_snapshot(path, expected_manifest_sha256=expected_manifest_sha256)
     bars = snapshot.bars
     if len({bar.symbol for bar in bars}) != 1 or len(bars) < 3:
         raise DataValidationError("one instrument and at least three candles required")
     calendar = SessionCalendar(holidays=config["risk"]["closed_dates"])
-    calendar.validate_intraday_bars(bars, bars[0].symbol, start=bars[0].timestamp, end=bars[-1].timestamp + FIVE_MINUTES, as_of=datetime.now(timezone.utc))
+    # Validate against the snapshot's immutable availability boundary, not
+    # the wall clock at a later replay.  This preserves the original
+    # completed-candle contract and makes historical reloads reproducible.
+    calendar.validate_intraday_bars(
+        bars,
+        bars[0].symbol,
+        start=bars[0].timestamp,
+        end=bars[-1].timestamp + FIVE_MINUTES,
+        as_of=snapshot.manifest.captured_at,
+    )
     for previous, current in zip(bars, bars[1:]):
         if abs(float(current.open / previous.close) - 1) > 0.20 or abs(float(current.close / current.open) - 1) > 0.20 or current.high / current.open > Decimal("1.20") or current.low / current.open < Decimal("0.80"):
             raise DataValidationError("20% price outlier/corporate-action discontinuity needs explicit review")
@@ -159,17 +214,40 @@ def experiment_plan(bars, config: Mapping[str, Any]) -> dict:
     }
 
 
-def build_trainer(bars, config: Mapping[str, Any], *, seed: int, device: str, metadata=None):
+def build_trainer(
+    bars,
+    config: Mapping[str, Any],
+    *,
+    seed: int,
+    device: str,
+    metadata=None,
+    policy_id: str | None = None,
+    source_dataset_hash: str | None = None,
+):
     import torch
     # Tiny MLPs otherwise incur large OpenMP launch overhead on many-core CPUs.
     torch.set_num_threads(1)
-    env = make_env(bars, config, training=True, policy_version=f"candidate-seed-{seed}")
+    policy_version = f"candidate-seed-{seed}"
+    env = make_env(
+        bars,
+        config,
+        training=True,
+        policy_version=policy_version,
+        source_dataset_hash=source_dataset_hash,
+    )
+    policy_id = policy_id or policy_version
+    clean_metadata = dict(metadata or {})
+    compatibility = env.checkpoint_compatibility(policy_id=policy_id)
+    if "checkpoint_compatibility" in clean_metadata and clean_metadata["checkpoint_compatibility"] != compatibility:
+        raise ValueError("trainer metadata checkpoint compatibility does not match its environment")
+    clean_metadata["checkpoint_compatibility"] = compatibility
+    clean_metadata.setdefault("policy_id", policy_id)
     allowed = DQNConfig.__dataclass_fields__
     values = {key: value for key, value in config["training"].items() if key in allowed}
     trainer = DQNTrainer(DQNConfig(
         **values, observation_dim=env.observation_dim, n_actions=env.n_actions,
         seed=seed, device=device,
-    ), metadata=metadata)
+    ), metadata=clean_metadata)
     return trainer, env
 
 
@@ -177,7 +255,8 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
     """Train a candidate only. The active registry/account is never modified."""
     output = Path(output)
     manifest_file = output / "experiment.json"
-    bars = load_market(data, config)
+    snapshot_manifest_sha256 = load_snapshot(data).manifest.digest
+    bars = load_market(data, config, expected_manifest_sha256=snapshot_manifest_sha256)
     plan = experiment_plan(bars, config)
     plan["selection"] = f"fixed seed {seed}; fixed config; no holdout-driven selection"
     train_bars = bars[slice(*plan["train"])]
@@ -189,12 +268,27 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
             raise FileExistsError("experiment exists; use --resume or a new --output")
         report = read_json(manifest_file)
         checkpoint = output / report["checkpoint"]
-        if report["dataset_hash"] != dataset_digest or report["config"] != config or report["seed"] != seed:
+        if (
+            report["dataset_hash"] != dataset_digest
+            or report.get("snapshot_manifest_sha256") != snapshot_manifest_sha256
+            or report["config"] != config
+            or report["seed"] != seed
+        ):
             raise ValueError("resume dataset, configuration or seed mismatch")
         if report.get("checkpoint_sha256") != file_hash(checkpoint):
             raise ValueError("resume checkpoint hash mismatch")
-        trainer = DQNTrainer.load_checkpoint(checkpoint, device=device)
-        env = make_env(train_bars, config, training=True, policy_version=f"candidate-seed-{seed}")
+        env = make_env(
+            train_bars,
+            config,
+            training=True,
+            policy_version=f"candidate-seed-{seed}",
+            source_dataset_hash=dataset_digest,
+        )
+        trainer = DQNTrainer.load_checkpoint(
+            checkpoint,
+            device=device,
+            expected_compatibility=env.checkpoint_compatibility(policy_id=output.name),
+        )
         if (output / "evaluation.json").exists():
             raise ValueError("evaluated experiments are immutable; train a new candidate version")
     else:
@@ -202,16 +296,27 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
             raise FileNotFoundError("no experiment to resume")
         metadata = {
             "dataset_hash": dataset_digest, "train_range": plan["train"],
-            "feature_schema": list(make_env(train_bars, config).feature_schema),
+            "feature_schema": list(make_env(train_bars, config, source_dataset_hash=dataset_digest).feature_schema),
             "feature_version": "paper-features-v1", "target_exposures": config["target_exposures"],
             "reward": "log(post_cost_equity_next/equity_current); no extra penalties",
-            "config_hash": digest(config), "code_commit": code_revision(), "dependencies": versions(),
+            "reward_version": "log-post-cost-equity-v1", "config_hash": digest(config),
+            "policy_id": output.name, "code_commit": code_revision(), "dependencies": versions(),
         }
-        trainer, env = build_trainer(train_bars, config, seed=seed, device=device, metadata=metadata)
+        trainer, env = build_trainer(
+            train_bars,
+            config,
+            seed=seed,
+            device=device,
+            metadata=metadata,
+            policy_id=output.name,
+            source_dataset_hash=dataset_digest,
+        )
+        metadata = trainer.metadata
         report = {
             "id": output.name, "created_at": datetime.now(timezone.utc).isoformat(),
             "dataset": os.path.relpath(Path(data).resolve(), output.resolve()),
-            "dataset_hash": dataset_digest, "provenance": sorted({bar.source for bar in bars}),
+            "dataset_hash": dataset_digest, "snapshot_manifest_sha256": snapshot_manifest_sha256,
+            "provenance": sorted({bar.source for bar in bars}),
             "plan": plan, "config": config, "seed": seed, "metadata": metadata,
             "checkpoint": "candidate.pt", "training_seconds": 0.0, "loss_history": [],
             "steps": 0, "updates": 0, "experience_transitions": 0,
@@ -223,11 +328,58 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
                 raise ValueError("paper experience provenance/action/risk/cost configuration mismatch")
             with SQLiteRepository(experience_db) as repo:
                 rows = [json.loads(row["payload"]) for row in repo.transitions()]
+                manifest = validate_manifest(
+                    experience_spec.get("experience"),
+                    expected_environment=env.checkpoint_compatibility(policy_id=experience_spec.get("policy_version", "source")),
+                    expected_symbol=env.symbol,
+                    expected_experiment_config_hash=digest(config),
+                    cutoff=train_bars[-1].timestamp,
+                    expected_snapshot_manifest_sha256=experience_spec.get("snapshot_manifest_sha256"),
+                )
+                source_path = Path(experience_db).parent / manifest["source_dataset"]
+                if not source_path.is_file():
+                    raise ExperienceProvenanceError(
+                        f"paper experience source dataset is missing: {source_path}"
+                    )
+                source_manifest_sha256 = load_snapshot(source_path).manifest.digest
+                if source_manifest_sha256 != manifest["snapshot_manifest_sha256"]:
+                    raise ExperienceProvenanceError("paper experience source snapshot manifest hash does not match")
+                source_bars = load_market(
+                    source_path,
+                    config,
+                    expected_manifest_sha256=manifest["snapshot_manifest_sha256"],
+                )
+                if digest([bar.to_mapping() for bar in source_bars]) != manifest["dataset_hash"]:
+                    raise ExperienceProvenanceError("paper experience source dataset hash does not match its manifest")
+                if manifest["source_range"][1] > len(source_bars):
+                    raise ExperienceProvenanceError("paper experience source range exceeds its dataset")
+                source_slice = source_bars[slice(*manifest["source_range"])]
+                source_probe = make_env(
+                    source_slice,
+                    config,
+                    policy_version=manifest["policy_version"],
+                    source_dataset_hash=manifest["dataset_hash"],
+                )
+                if source_probe.dataset_hash != manifest["slice_hash"]:
+                    raise ExperienceProvenanceError("paper experience source slice hash does not match its manifest")
+                if source_slice[0].timestamp.isoformat() != manifest["source_start_timestamp"] or source_slice[-1].timestamp.isoformat() != manifest["source_end_timestamp"]:
+                    raise ExperienceProvenanceError("paper experience source timestamp range does not match its manifest")
+                rows = list(validate_rows(
+                    rows,
+                    manifest,
+                    cutoff=train_bars[-1].timestamp,
+                    expected_environment=env.checkpoint_compatibility(policy_id=experience_spec.get("policy_version", "source")),
+                ))
+                cursor = repo.load_state(PaperTradingEnv.CHECKPOINT_KEY)
+                if not isinstance(cursor, Mapping):
+                    raise ExperienceProvenanceError("paper experience environment cursor is missing")
+                if cursor.get("episode_id") != manifest["episode_id"]:
+                    raise ExperienceProvenanceError("paper experience cursor episode identity does not match its manifest")
+                if cursor.get("history_hash") != history_digest(manifest["episode_id"], rows):
+                    raise ExperienceProvenanceError("paper experience transition history digest is invalid")
+                if cursor.get("steps") != len(rows):
+                    raise ExperienceProvenanceError("paper experience cursor count does not match its transition database")
             for row in rows:
-                if datetime.fromisoformat(row["timestamp"]) > train_bars[-1].timestamp:
-                    raise ValueError("paper experience overlaps validation/test/future training cutoff")
-                if tuple(row["feature_schema"]) != env.feature_schema:
-                    raise ValueError("paper experience feature schema mismatch")
                 trainer.observe(Transition(**{key: row[key] for key in Transition.__dataclass_fields__}))
             report["experience_transitions"] = len(rows)
     budget = int(steps if steps is not None else config["training"]["steps"])
@@ -259,9 +411,15 @@ def train_experiment(data: str | Path, output: str | Path, config: Mapping[str, 
         remaining -= chunk
         start = time.perf_counter()
     # Reload as an independent integrity/inference check, not just a save claim.
-    loaded = DQNTrainer.load_checkpoint(checkpoint, device="cpu")
+    loaded = DQNTrainer.load_checkpoint(
+        checkpoint,
+        device="cpu",
+        expected_compatibility=env.checkpoint_compatibility(policy_id=output.name),
+    )
     observation, _ = env.reset(seed=seed)
     report["reloaded_action"] = loaded.act(observation)
+    if not env.action_space.contains(report["reloaded_action"]):
+        raise ValueError("reloaded checkpoint produced an action outside the target environment action space")
     # Convenience alias is never the resumable source of truth.
     trainer.save_checkpoint(output / "candidate.pt")
     save_json(manifest_file, report)
@@ -290,12 +448,13 @@ def _aggregate_summary(policy_id: str, rows: list[dict], key: str, comparison_ke
     # Disjoint bar windows can still split the same exchange session. Do not
     # count a boundary date twice, or count seeds as independent market dates.
     sessions = {label for row in rows for label in row["session_ids"]}
+    available_shortfalls = [item["expected_shortfall"] for item in flattened if item["expected_shortfall"] is not None]
     metrics = PerformanceMetrics(
         net_return=statistics.median(compound),
         max_drawdown=max(item["max_drawdown"] for item in flattened),
         sessions=len(sessions),
         trades=int(statistics.median(sum(item["trades"] for item in values) for values in by_seed.values())),
-        expected_shortfall=max(item["expected_shortfall"] or 0 for item in flattened),
+        expected_shortfall=max(available_shortfalls) if available_shortfalls else None,
         total_fees=statistics.fmean(sum(item["total_fees"] for item in values) for values in by_seed.values()),
         turnover=statistics.fmean(sum(item["turnover"] for item in values) for values in by_seed.values()),
     )
@@ -338,7 +497,13 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
     output = Path(output)
     manifest = read_json(output / "experiment.json")
     config = manifest["config"]
-    bars = load_market(output / manifest["dataset"], config)
+    snapshot_manifest_sha256 = manifest.get("snapshot_manifest_sha256")
+    if not isinstance(snapshot_manifest_sha256, str) or not snapshot_manifest_sha256:
+        raise ValueError("experiment lacks a pinned snapshot manifest; start a new versioned experiment")
+    bars = load_market(
+        output / manifest["dataset"], config,
+        expected_manifest_sha256=snapshot_manifest_sha256,
+    )
     if manifest["dataset_hash"] != digest([bar.to_mapping() for bar in bars]):
         raise ValueError("evaluation dataset differs from training manifest")
     checkpoint = output / manifest["checkpoint"]
@@ -346,6 +511,7 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
         raise ValueError("candidate checkpoint changed since training")
     destination = output / "evaluation.json"
     if destination.exists():
+        verify_receipt_hash(destination)
         return _session_audit(read_json(destination), bars, output)  # Never re-evaluate a consumed holdout.
     from .evaluation import WalkForwardSplit
     rows = []
@@ -358,19 +524,82 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
             model_dir = output / "walk_forward" / f"fold-{fold_index}-seed-{seed}"
             model_dir.mkdir(parents=True, exist_ok=True)
             model_file = model_dir / "candidate.pt"
+            policy_id = f"wf-{fold_index}-seed-{seed}"
+            expected_env = make_env(
+                training,
+                config,
+                training=True,
+                policy_version=policy_id,
+                source_dataset_hash=manifest["dataset_hash"],
+            )
+            receipt_file = model_dir / "training.json"
             if model_file.exists():
-                trainer = DQNTrainer.load_checkpoint(model_file, device=device)
-                if trainer.metadata.get("fold") != definition or trainer.metadata.get("config_hash") != digest(config):
+                if not receipt_file.is_file():
+                    raise ValueError(f"walk-forward checkpoint {model_file} has no training receipt")
+                receipt = read_json(receipt_file)
+                if receipt.get("checkpoint_sha256") != file_hash(model_file):
+                    raise ValueError(f"walk-forward checkpoint integrity mismatch: {model_file}")
+                trainer = DQNTrainer.load_checkpoint(
+                    model_file,
+                    device=device,
+                    expected_compatibility=expected_env.checkpoint_compatibility(policy_id=policy_id),
+                )
+                if (
+                    trainer.metadata.get("fold") != definition
+                    or trainer.metadata.get("config_hash") != digest(config)
+                    or trainer.metadata.get("dataset_hash") != manifest["dataset_hash"]
+                    or trainer.metadata.get("policy_id") != policy_id
+                    or receipt.get("fold") != definition
+                    or receipt.get("config_hash") != digest(config)
+                    or receipt.get("dataset_hash") != manifest["dataset_hash"]
+                    or receipt.get("policy_id") != policy_id
+                    or receipt.get("steps") != trainer.environment_steps
+                    or receipt.get("observation_dim") != trainer.config.observation_dim
+                    or receipt.get("n_actions") != trainer.config.n_actions
+                    or not isinstance(receipt.get("seconds"), (int, float))
+                    or not math.isfinite(float(receipt.get("seconds", float("nan"))))
+                    or receipt.get("seconds") < 0
+                ):
                     raise ValueError("walk-forward resume checkpoint mismatch")
-                duration = read_json(model_dir / "training.json")["seconds"]
+                duration = receipt["seconds"]
+            elif receipt_file.exists():
+                raise ValueError(f"walk-forward training receipt exists without checkpoint: {receipt_file}")
             else:
-                trainer, env = build_trainer(training, config, seed=seed, device=device, metadata={"fold": definition, "config_hash": digest(config), "dataset_hash": manifest["dataset_hash"]})
+                trainer, env = build_trainer(
+                    training,
+                    config,
+                    seed=seed,
+                    device=device,
+                    policy_id=policy_id,
+                    source_dataset_hash=manifest["dataset_hash"],
+                    metadata={
+                        "fold": definition,
+                        "config_hash": digest(config),
+                        "dataset_hash": manifest["dataset_hash"],
+                        "policy_id": policy_id,
+                    },
+                )
                 started = time.perf_counter()
                 trainer.train(env, config["training"]["walk_forward_steps"])
                 duration = time.perf_counter() - started
                 trainer.save_checkpoint(model_file)
-                save_json(model_dir / "training.json", {"seconds": duration, "steps": trainer.environment_steps, "checkpoint_sha256": file_hash(model_file)})
-            factory = lambda block: make_env(block, config, policy_version=f"wf-{fold_index}-seed-{seed}")
+                save_json(receipt_file, {
+                    "seconds": duration,
+                    "steps": trainer.environment_steps,
+                    "checkpoint_sha256": file_hash(model_file),
+                    "fold": definition,
+                    "config_hash": digest(config),
+                    "dataset_hash": manifest["dataset_hash"],
+                    "policy_id": policy_id,
+                    "observation_dim": trainer.config.observation_dim,
+                    "n_actions": trainer.config.n_actions,
+                })
+            factory = lambda block: make_env(
+                block,
+                config,
+                policy_version=policy_id,
+                source_dataset_hash=manifest["dataset_hash"],
+            )
             candidate = evaluate_policy(factory(test), trainer.act)
             validation_result = evaluate_policy(factory(validation), trainer.act)
             baselines = evaluate_baselines(lambda: factory(test), seed=seed)
@@ -385,10 +614,31 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
             rows.append(row)
             save_json(output / "walk_forward_progress.json", rows)
     holdout = bars[slice(*plan["test"])]
-    frozen = DQNTrainer.load_checkpoint(checkpoint, device=device)
-    final_env = lambda: make_env(holdout, config, policy_version=manifest["id"])
-    final = evaluate_policy(final_env(), frozen.act)
-    validation = evaluate_policy(make_env(bars[slice(*plan["validation"])], config), frozen.act)
+    final_env_instance = make_env(
+        holdout,
+        config,
+        policy_version=manifest["id"],
+        source_dataset_hash=manifest["dataset_hash"],
+    )
+    frozen = DQNTrainer.load_checkpoint(
+        checkpoint,
+        device=device,
+        expected_compatibility=final_env_instance.checkpoint_compatibility(policy_id=manifest["id"]),
+    )
+    final = evaluate_policy(final_env_instance, frozen.act)
+    final_env = lambda: make_env(
+        holdout,
+        config,
+        policy_version=manifest["id"],
+        source_dataset_hash=manifest["dataset_hash"],
+    )
+    validation_env = make_env(
+        bars[slice(*plan["validation"])],
+        config,
+        policy_version=manifest["id"],
+        source_dataset_hash=manifest["dataset_hash"],
+    )
+    validation = evaluate_policy(validation_env, frozen.act)
     baselines = evaluate_baselines(final_env, seed=manifest["seed"])
     comparison = digest({"data": manifest["dataset_hash"], "config": config, "folds": plan["folds"]})
     summary = _aggregate_summary(manifest["id"], rows, "candidate", comparison, seeds)
@@ -396,12 +646,32 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
     registry_path = Path(registry_path)
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     with CandidateRegistry(registry_path, gates=PromotionGates(**config["promotion"])) as registry:
-        registry.register(manifest["id"], checkpoint, metadata={"experiment_hash": digest(manifest), "provenance": manifest["provenance"]})
+        registry.register(
+            manifest["id"],
+            checkpoint,
+            metadata={
+                "experiment_hash": digest(manifest),
+                "provenance": manifest["provenance"],
+                "checkpoint_compatibility": frozen.metadata.get("checkpoint_compatibility"),
+            },
+        )
+        safety_receipts = {
+            name: {
+                "version": "promotion-evidence-v1",
+                "name": name,
+                "passed": False,
+                "reason": "independent receipt was not supplied by offline evaluation",
+                "evaluation_id": f"{manifest['id']}-walk-forward-v1",
+            }
+            for name in ("accounting", "data_integrity", "risk", "shadow", "recovery")
+        }
         evidence = PromotionEvidence(
             f"{manifest['id']}-walk-forward-v1", summary, baseline_summaries,
-            # Offline mock/replay results are not an authorised live shadow trial.
-            accounting_ok=True, data_integrity_ok=True, risk_ok=True,
+            # Offline evaluation does not manufacture independent safety
+            # receipts.  Missing evidence remains false and fail-closed.
+            accounting_ok=False, data_integrity_ok=False, risk_ok=False,
             shadow_passed=False, recovery_passed=False,
+            receipts=safety_receipts,
         )
         decision = registry.consider(manifest["id"], evidence)
     report = {
@@ -411,6 +681,7 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
         "validation": _episode_report(validation), "test": _episode_report(final),
         "baselines": {name: _episode_report(result) for name, result in baselines.items()},
         "promotion": asdict(decision),
+        "safety_receipts": safety_receipts,
         "limitations": [
             "Synthetic data tests software, not a real market edge; no profit claim.",
             "No hyperparameter search or best-seed selection; final holdout assessed once.",
@@ -420,4 +691,5 @@ def evaluate_experiment(output: str | Path, *, registry_path="models/registry.sq
         ],
     }
     save_json(destination, report)
+    write_receipt_hash(destination)
     return _session_audit(read_json(destination), bars, output)

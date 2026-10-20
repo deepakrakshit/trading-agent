@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 import csv
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import io
@@ -39,6 +39,7 @@ _SOURCE_FIELDS = frozenset({
     "calendar_version", "timestamp_convention", "api_origin", "endpoint", "request_start",
     "request_end", "license_reference",
 })
+_BAR_INTERVALS = {"FIVE_MINUTE": timedelta(minutes=5)}
 
 
 class SnapshotError(DataValidationError):
@@ -72,6 +73,15 @@ def _metadata(values: Mapping[str, str]) -> Mapping[str, str]:
             raise SnapshotError("endpoint metadata must be a path without query data")
         clean[key] = value
     return MappingProxyType(clean)
+
+
+def _validate_bar_contract(metadata: Mapping[str, str]) -> timedelta:
+    if metadata.get("timestamp_convention") != "BAR_START":
+        raise SnapshotError("snapshot metadata must declare timestamp_convention=BAR_START")
+    interval_name = metadata.get("interval")
+    if interval_name not in _BAR_INTERVALS:
+        raise SnapshotError("snapshot metadata must declare interval=FIVE_MINUTE")
+    return _BAR_INTERVALS[interval_name]
 
 
 def _hash(payload: bytes) -> str:
@@ -123,7 +133,9 @@ class SnapshotManifest:
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
         object.__setattr__(self, "captured_at", captured)
-        object.__setattr__(self, "source_metadata", _metadata(self.source_metadata))
+        metadata = _metadata(self.source_metadata)
+        _validate_bar_contract(metadata)
+        object.__setattr__(self, "source_metadata", metadata)
 
     def to_mapping(self) -> dict[str, Any]:
         """``start`` and ``end`` are the first/last actual bar starts, inclusive."""
@@ -262,7 +274,16 @@ def write_snapshot(
         raise SnapshotError("bar source does not match declared snapshot provenance")
     # Validate source fields before serialising data or touching the filesystem.
     source = _source_name(source)
-    metadata = _metadata(source_metadata or {})
+    metadata_values = dict(source_metadata or {})
+    # The canonical project snapshot format is five-minute BAR_START data.
+    # Keep direct callers backwards-compatible while rejecting any explicit
+    # contract that disagrees with that format.
+    metadata_values.setdefault("timestamp_convention", "BAR_START")
+    metadata_values.setdefault("interval", "FIVE_MINUTE")
+    metadata = _metadata(metadata_values)
+    interval = _validate_bar_contract(metadata)
+    if any(bar.timestamp + interval > captured for bar in materialised):
+        raise SnapshotError("snapshot contains a forming/unavailable candle at capture time")
     payload = _encode(materialised, format_)
     manifest = SnapshotManifest(
         path.name, format_, source, provenance, len(materialised),

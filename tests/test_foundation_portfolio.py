@@ -88,3 +88,20 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(snapshot.equity, D("90"))
         self.assertEqual(snapshot.high_water_mark, D("100"))
         self.assertEqual(snapshot.drawdown, D("0.1"))
+
+    def test_later_global_mark_requires_fresh_marks_for_every_holding(self) -> None:
+        ledger = PortfolioLedger(1000)
+        ledger.apply_fill(fill("BUY", 1, "100", order_id="abc"))
+        xyz = replace(fill("BUY", 1, "100", order_id="xyz"), symbol="XYZ")
+        ledger.apply_fill(xyz)
+        ledger.mark_to_market({"ABC": 100, "XYZ": 100}, timestamp=NOW)
+        with self.assertRaisesRegex(LedgerError, "missing mark.*XYZ"):
+            ledger.mark_to_market({"ABC": 101}, timestamp=NOW + timedelta(minutes=5))
+
+    def test_restore_reconciles_persisted_ledger_to_fill_records(self) -> None:
+        ledger = PortfolioLedger(1000)
+        ledger.apply_fill(fill("BUY", 2, "100", order_id="buy"))
+        state = ledger.export_state()
+        state["cash"] = "999.00"
+        with self.assertRaisesRegex(LedgerError, "reconcile|cash|high-water"):
+            PortfolioLedger.from_state(state)

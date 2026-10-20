@@ -433,6 +433,9 @@ class SmartAPIQuoteProvider:
         row = data["fetched"][0]
         if not isinstance(row, dict) or row.get("exchange") != "NSE" or row.get("symbolToken") != token:
             raise SmartAPIResponseError("SmartAPI quote instrument does not match the configured mapping")
+        returned_symbol = row.get("tradingSymbol")
+        if returned_symbol is not None and returned_symbol != symbol:
+            raise SmartAPIResponseError("SmartAPI quote symbol does not match the configured mapping")
         timestamp = _quote_timestamp(row.get("exchFeedTime"))
         trade_time = _quote_timestamp(row["exchTradeTime"]) if row.get("exchTradeTime") else None
         if received - timestamp > self.max_age or timestamp - received > self.future_tolerance:

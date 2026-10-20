@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from copy import deepcopy
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -234,3 +235,22 @@ def test_resume_requires_the_entire_unchanged_transition_history(corruption):
             restarted.resume()
         with pytest.raises(RuntimeError, match="reset.*resume"):
             restarted.step(0)
+
+
+@pytest.mark.parametrize("corruption", ["done", "last-info", "episode-options", "rng"])
+def test_semantically_corrupt_environment_cursor_fails_before_resume(corruption):
+    with SQLiteRepository() as repo:
+        env = PaperTradingEnv(BARS, repository=repo, **KWARGS)
+        env.reset(seed=12)
+        state = deepcopy(repo.load_state(PaperTradingEnv.CHECKPOINT_KEY))
+        if corruption == "done":
+            state["done"] = True
+        elif corruption == "last-info":
+            state["last_info"]["index"] = 999
+        elif corruption == "episode-options":
+            state["episode_options"]["start_index"] = 999
+        else:
+            state["rng_state"] = {"invalid": True}
+        repo.save_state(PaperTradingEnv.CHECKPOINT_KEY, state)
+        with pytest.raises((PersistenceError, ValueError), match="checkpoint|cursor|RNG|rng|last_info|episode"):
+            PaperTradingEnv(BARS, repository=repo, **KWARGS)

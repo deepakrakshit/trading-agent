@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Protocol, Sequence, runtime_checkable
 
-from .bars import DataProvenance, MarketBar, utc_timestamp
+from .bars import DataProvenance, DataValidationError, MarketBar, utc_timestamp
 from .validation import validate_bars
 
 
@@ -100,13 +100,37 @@ class CSVBarProvider(InMemoryBarProvider):
         path: str | Path,
         *,
         provenance: str = DataProvenance.HISTORICAL.value,
+        captured_at: datetime | None = None,
+        interval: timedelta = timedelta(minutes=5),
     ) -> None:
+        if interval <= timedelta(0):
+            raise ValueError("interval must be positive")
+        captured = utc_timestamp(captured_at) if captured_at is not None else datetime.now(timezone.utc)
         with Path(path).open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            expected = {"symbol", "timestamp", "open", "high", "low", "close", "volume", "source", "complete"}
+            headers = set(reader.fieldnames or ())
+            required = {"symbol", "timestamp", "open", "high", "low", "close", "volume"}
+            if not required <= headers or headers - expected:
+                raise DataValidationError("CSV columns do not match the canonical market-bar schema")
             rows = []
-            for row in csv.DictReader(handle):
+            for row in reader:
                 if "source" not in row:
                     row["source"] = provenance
-                rows.append(MarketBar.from_mapping(row))
+                if "complete" in row:
+                    value = row["complete"]
+                    if isinstance(value, str) and value.strip().lower() in {"true", "1"}:
+                        row["complete"] = True
+                    elif isinstance(value, str) and value.strip().lower() in {"false", "0"}:
+                        row["complete"] = False
+                    else:
+                        raise DataValidationError("CSV complete values must be true or false")
+                bar = MarketBar.from_mapping(row)
+                if bar.timestamp + interval > captured:
+                    raise DataValidationError(
+                        f"CSV contains a forming/unavailable candle at {bar.timestamp.isoformat()}"
+                    )
+                rows.append(bar)
         super().__init__(rows, provenance=provenance)
 
 

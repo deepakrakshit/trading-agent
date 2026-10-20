@@ -205,6 +205,16 @@ class PortfolioLedger:
                 raise LedgerError(f"mark price for {symbol} must be positive and finite")
             updated_prices[symbol] = price
         missing = [symbol for symbol in self._positions if symbol not in updated_prices]
+        if (
+            timestamp is not None
+            and self._last_timestamp is not None
+            and timestamp > self._last_timestamp
+        ):
+            # A portfolio mark at a later global time must include a fresh
+            # price for every held symbol.  Reusing an older omitted mark
+            # would make equity and risk decisions appear current while one
+            # position is stale.
+            missing = [symbol for symbol in self._positions if symbol not in prices]
         if missing:
             raise LedgerError(f"missing mark price for: {', '.join(sorted(missing))}")
         if timestamp is not None:
@@ -360,12 +370,59 @@ class PortfolioLedger:
         restored = self.from_state(state)
         self.__dict__.update(restored.__dict__)
 
+    def adopt(self, other: "PortfolioLedger") -> None:
+        """Adopt a ledger already validated through this process's clone path.
+
+        Paper execution builds a candidate ledger from the current state,
+        applies one hypothetical fill, and then commits that candidate.  It is
+        unnecessary to replay every historical fill again on each successful
+        step; persisted/external state still enters through :meth:`from_state`.
+        """
+
+        if not isinstance(other, PortfolioLedger):
+            raise LedgerError("can only adopt another PortfolioLedger")
+        self.__dict__.update(deepcopy(other.__dict__))
+
     @classmethod
     def from_state(cls, state: Mapping[str, Any]) -> "PortfolioLedger":
         """Restore a ledger exported by :meth:`export_state`."""
 
-        ledger = cls(state["cash"])
-        if ledger.cash != decimal_value(state["cash"], "cash"):
+        if not isinstance(state, Mapping):
+            raise LedgerError("persisted ledger must be a mapping")
+        fill_records = state.get("fill_records", {})
+        if not isinstance(fill_records, Mapping):
+            raise LedgerError("persisted fill_records must be a mapping")
+        fill_ids = set(state.get("applied_fill_ids", ()))
+        if set(fill_records) != fill_ids:
+            raise LedgerError("persisted fill idempotency records do not agree")
+        if any(not isinstance(value, str) or not value for value in fill_ids):
+            raise LedgerError("persisted fill IDs are invalid")
+        parsed_fills: list[LedgerFill] = []
+        for fill_id, payload in fill_records.items():
+            if not isinstance(payload, Mapping) or payload.get("fill_id") != fill_id:
+                raise LedgerError("persisted fill record identity does not agree")
+            try:
+                parsed_fills.append(LedgerFill.from_mapping(payload))
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                raise LedgerError("persisted fill record is invalid") from exc
+        parsed_order_ids = {fill.client_order_id for fill in parsed_fills}
+        applied_order_ids = set(state.get("applied_order_ids", ()))
+        if applied_order_ids != parsed_order_ids:
+            raise LedgerError("persisted order idempotency records do not agree")
+
+        current_cash = decimal_value(state["cash"], "cash")
+        initial_cash = money(current_cash - sum((fill.cost.cash_effect for fill in parsed_fills), Decimal("0")))
+        if initial_cash <= 0:
+            raise LedgerError("persisted fills imply a non-positive initial cash balance")
+        rebuilt = cls(initial_cash)
+        try:
+            for fill in sorted(parsed_fills, key=lambda item: item.occurred_at):
+                rebuilt.apply_fill(fill)
+        except (LedgerError, ValueError, ArithmeticError) as exc:
+            raise LedgerError("persisted fills cannot rebuild the ledger") from exc
+
+        ledger = cls(current_cash)
+        if current_cash != money(current_cash):
             raise LedgerError("persisted cash must be an integer-paise amount")
         ledger._positions = {
             symbol: Position(values["quantity"], decimal_value(values["cost_basis"], "cost_basis"))
@@ -375,9 +432,9 @@ class PortfolioLedger:
             symbol: decimal_value(price, f"mark[{symbol}]")
             for symbol, price in state.get("last_prices", {}).items()
         }
-        ledger._applied_fill_ids = set(state.get("applied_fill_ids", ()))
-        ledger._fill_records = deepcopy(state.get("fill_records", {}))
-        ledger._applied_order_ids = set(state.get("applied_order_ids", ()))
+        ledger._applied_fill_ids = fill_ids
+        ledger._fill_records = deepcopy(fill_records)
+        ledger._applied_order_ids = applied_order_ids
         ledger._realized_pnl = decimal_value(state.get("realized_pnl", "0"), "realized_pnl")
         ledger._fees_paid = decimal_value(state.get("fees_paid", "0"), "fees_paid")
         ledger._high_water_mark = decimal_value(state.get("high_water_mark", state["cash"]), "high_water_mark")
@@ -403,6 +460,16 @@ class PortfolioLedger:
             or any(symbol not in ledger._last_prices for symbol in ledger._positions)
         ):
             raise LedgerError("persisted ledger violates cash/position invariants")
+        if (
+            ledger.cash != rebuilt.cash
+            or ledger.positions != rebuilt.positions
+            or ledger.realized_pnl != rebuilt.realized_pnl
+            or ledger.fees_paid != rebuilt.fees_paid
+            or ledger.applied_fill_ids != rebuilt.applied_fill_ids
+        ):
+            raise LedgerError("persisted ledger does not reconcile to its fill records")
+        if ledger.high_water_mark < ledger._equity():
+            raise LedgerError("persisted high-water mark is below current equity")
         return ledger
 
     def _equity(self) -> Decimal:

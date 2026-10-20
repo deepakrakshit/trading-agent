@@ -87,6 +87,7 @@ class RiskContext:
     session_start_equity: Decimal | str | float
     positions: Mapping[str, int] = field(default_factory=dict)
     marks: Mapping[str, Decimal | str | float] = field(default_factory=dict)
+    event_timestamp: datetime | None = None
 
     def __post_init__(self) -> None:
         for name in ("cash", "equity", "high_water_mark", "session_start_equity"):
@@ -95,6 +96,10 @@ class RiskContext:
         if self.timestamp.tzinfo is None or self.timestamp.utcoffset() is None:
             raise ValueError("timestamp must be timezone-aware")
         object.__setattr__(self, "timestamp", self.timestamp.astimezone(timezone.utc))
+        if self.event_timestamp is not None:
+            if self.event_timestamp.tzinfo is None or self.event_timestamp.utcoffset() is None:
+                raise ValueError("event_timestamp must be timezone-aware")
+            object.__setattr__(self, "event_timestamp", self.event_timestamp.astimezone(timezone.utc))
         if self.feed_timestamp is not None:
             if self.feed_timestamp.tzinfo is None or self.feed_timestamp.utcoffset() is None:
                 raise ValueError("feed_timestamp must be timezone-aware")
@@ -194,7 +199,8 @@ class RiskSupervisor:
 
         if self._kill_switch:
             reasons.append(f"kill switch active: {self._kill_reason}")
-        if not self.market_is_open(context.timestamp):
+        market_timestamp = context.event_timestamp or context.timestamp
+        if not self.market_is_open(market_timestamp):
             reasons.append("market session is closed")
         if context.cash < 0:
             reasons.append("cash invariant violated")
@@ -270,10 +276,10 @@ class RiskSupervisor:
             return self._rejected("maximum order quantity exceeded")
         if (
             self._last_execution is not None
-            and context.timestamp - self._last_execution < self.limits.min_order_interval
+            and (context.event_timestamp or context.timestamp) - self._last_execution < self.limits.min_order_interval
         ):
             return self._rejected("minimum order interval not reached")
-        session = self.session_id(context.timestamp)
+        session = self.session_id(context.event_timestamp or context.timestamp)
         if (
             self.limits.max_orders_per_session is not None
             and session == self._execution_session

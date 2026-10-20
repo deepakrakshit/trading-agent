@@ -2,7 +2,7 @@
 
 ## Final test state
 
-The combined suite currently contains **225 tests: 225 passed, 0 failed, 0 skipped**. Two advisory warnings come from the legacy injected-execution Gymnasium reference environment's unbounded observation space. The canonical CLI environment has finite float32 bounds and passes the checker. Warnings were not suppressed.
+The combined suite currently contains **248 tests: 248 passed, 0 failed, 0 skipped** in the restored `.venv` environment. The run emitted **65 warnings**: intentional deprecation notices for the legacy injected-execution compatibility environment and two advisory Gymnasium warnings for that legacy environment's unbounded observation space. The canonical CLI environment has finite float32 bounds and passes the checker. Warnings were not suppressed.
 
 `tests/conftest.py` blocks socket connections automatically. The single offline test command is:
 
@@ -16,9 +16,9 @@ It runs pytest, source/test compilation and `pip check`; it does not download da
 
 | Check | Actual result |
 | --- | --- |
-| `make test` in `.venv` | 225 passed; compilation and dependency check passed |
+| `make test` in `.venv` | 248 passed; compilation and dependency check passed |
 | `make test PYTHON=.venv-cuda/bin/python` | Same CPU-mode suite passed with the CUDA-enabled wheel; not GPU execution evidence |
-| Fresh `.venv-repro`, lock install, editable install, `make test PYTHON=.venv-repro/bin/python` | 225 passed, 0 skipped; compilation and dependency check passed |
+| Fresh `.venv-repro`, lock install, editable install, `make test PYTHON=.venv-repro/bin/python` | 248 passed, 0 skipped; compilation and dependency check passed |
 | Canonical `Gymnasium check_env` | Passed in the test suite |
 | `git diff --check` | Passed for working code steps |
 | `.venv-cuda/bin/python -m trading_agent.cli doctor --require-cuda` | **Exit 2:** no usable CUDA device/driver |
@@ -40,6 +40,10 @@ It runs pytest, source/test compilation and `pip check`; it does not download da
 - Predeclared promotion acceptance/rejection, immutable evidence/artifact checks and rollback to an earlier accepted policy in isolated tests.
 - No automatic unapproved candidate usage: active fallback is cash; explicit shadow is required.
 - Full replay vs split-and-resumed replay, CLI parsing/doctor/data generation, loss attribution reconciliation and paper-experience training with chronological cutoff checks.
+- Artificial episode-horizon liquidation is terminal and DQN-masked; collection-budget truncation remains bootstrap-capable.
+- Explicit paper-experience manifests and row/database provenance checks reject incompatible datasets, instruments, feature semantics, execution versions, and tampering.
+- DQN checkpoint v2 semantic compatibility, walk-forward SHA-256 receipts, strict cursor semantics, and hard versioned promotion receipts.
+- Completed-bar clock monotonicity, fresh marks for every held symbol, reconciled ledger restore, strict CSV completion, and pinned snapshot-manifest reloads.
 
 Passing tests do not establish a profitable strategy, an exchange-grade fill model, live-feed reliability or statistical sufficiency.
 
@@ -96,6 +100,15 @@ make test PYTHON=.venv-repro/bin/python
 - Kept immutable per-step checkpoints so a crash cannot destroy the prior manifest/checkpoint pair.
 - Removed exit-candle future high/low from holding-window MFE/MAE.
 - Corrected walk-forward independent-session counting. Existing rejected receipts/scores remain archived, with a separate correction audit; see `docs/model_evaluation.md`.
+
+## T1 RL pipeline hardening
+
+The seven follow-up findings from the RL/environment audit are implemented and
+covered by targeted regressions. See `docs/t1_hardening.md` for the exact
+termination policy, checkpoint v2 rejection/migration policy, provenance
+manifest fields, changed files, and reproduction commands. Preserved v1
+checkpoints and account artifacts are not rewritten; the current code rejects
+them explicitly instead of silently guessing their semantics.
 
 ## Remaining work and precise blockers
 

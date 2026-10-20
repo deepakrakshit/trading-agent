@@ -80,3 +80,21 @@ class MarketDataTests(unittest.TestCase):
             path.write_text(header + row + row, encoding="utf-8")
             with self.assertRaisesRegex(DataValidationError, "duplicate"):
                 CSVBarProvider(path)
+
+    def test_csv_completion_is_strict_and_snapshot_rows_are_available(self) -> None:
+        with TemporaryDirectory(dir=".") as directory:
+            path = Path(directory) / "bars.csv"
+            header = "symbol,timestamp,open,high,low,close,volume,complete\n"
+            completed = "ABC,2026-01-05T09:30:00+05:30,10,11,9,10,100,true\n"
+            path.write_text(header + completed, encoding="utf-8")
+            provider = CSVBarProvider(path, captured_at=START + timedelta(minutes=5))
+            self.assertTrue(provider.all_bars()[0].complete)
+
+            forming = "ABC,2026-01-05T09:30:00+05:30,10,11,9,10,100,true\n"
+            path.write_text(header + forming, encoding="utf-8")
+            with self.assertRaisesRegex(DataValidationError, "forming/unavailable"):
+                CSVBarProvider(path, captured_at=START + timedelta(minutes=4, seconds=59))
+
+            path.write_text(header.replace(",complete", ",unknown") + completed, encoding="utf-8")
+            with self.assertRaisesRegex(DataValidationError, "columns"):
+                CSVBarProvider(path, captured_at=START + timedelta(minutes=5))

@@ -48,7 +48,7 @@ For durable local output, bind-mount a writable `runs/` directory (the container
 make demo
 ```
 
-On a fresh checkout this creates 24 **SYNTHETIC weekday** sessions, trains 3,000 Double-DQN interaction steps, saves/reloads checkpoints, runs three-seed walk-forward evaluation and cash/rule/random baselines, and restarts a SQLite shadow paper account. On subsequent runs it resumes the existing account and reads the immutable evaluation receipt; it does **not** retune on that holdout.
+On a fresh checkout this creates 24 **SYNTHETIC weekday** sessions, trains 3,000 Double-DQN interaction steps into the new `models/initial-v2/` experiment, saves/reloads checkpoints, runs three-seed walk-forward evaluation and cash/rule/random baselines, and restarts a SQLite shadow paper account under `runs/demo-v2/`. On subsequent runs it resumes that v2 account and reads its pinned evaluation receipt; it does **not** retune on that holdout. Preserved v1 artifacts are historical receipts and are rejected by the current loader rather than overwritten.
 
 Actual first run: **₹9,502.08** final shadow equity, **311 paper fills / 29 closed inventory round trips**, and **₹188.32 explicit fees**. The candidate was rejected; the separate active-policy account remains **₹10,000 cash**. These synthetic results demonstrate the software, not a profitable strategy. Details: `docs/model_evaluation.md`.
 
@@ -79,7 +79,7 @@ Run from the repository root. The first `generate` command is for a fresh path: 
 .venv/bin/python -m trading_agent.cli paper --db runs/research/account.sqlite --resume
 
 # Active policy only: without an accepted candidate, this safely uses cash-v1
-.venv/bin/python -m trading_agent.cli paper --experiment models/initial-v1 --db runs/new-active/account.sqlite --strategy active
+.venv/bin/python -m trading_agent.cli paper --experiment models/initial-v2 --db runs/new-active/account.sqlite --strategy active
 
 # Durable account and audit records
 .venv/bin/python -m trading_agent.cli account --db runs/demo/account.sqlite
@@ -100,7 +100,7 @@ Run from the repository root. The first `generate` command is for a fresh path: 
 
 ### Controlled paper-experience learning
 
-`--experience-db` trains a **new candidate** from recorded numerical transitions, not from loss narratives and not by updating active weights after a trade. It rejects observations after the new training cutoff or with different provenance/features/action/risk/cost settings. The earlier holdout may become training history only in a **new** chronological experiment with a later untouched test block.
+`--experience-db` trains a **new candidate** from recorded numerical transitions, not from loss narratives and not by updating active weights after a trade. New paper accounts write a `paper-experience-v1` manifest beside the SQLite database. Import verifies the source dataset and slice hashes, instrument, feature/action/reward/execution/cost/risk versions, policy/account identity, contiguous history digest, and cutoff. It rejects observations after the new training cutoff or with different provenance/features/action/risk/cost settings. The earlier holdout may become training history only in a **new** chronological experiment with a later untouched test block.
 
 This exact additional offline cycle was executed:
 
@@ -111,6 +111,23 @@ This exact additional offline cycle was executed:
 ```
 
 It imported 449 transitions, performed 1,000 additional environment interactions and 347 optimizer updates in total, and was rejected on a later test window. No performance improvement is claimed. Recurring/always-on retraining is not configured; this release uses deliberate CLI cycles.
+
+### Checkpoint and environment compatibility
+
+The supported financial simulation is `trading_agent.paper_env.PaperTradingEnv`.
+Artificial `episode_length` boundaries are task-defined terminal transitions:
+the configured terminal closeout is included in the reward and DQN does not
+bootstrap through the account reset. Only an explicit trainer collection
+budget is represented as a bootstrap-capable truncation. Checkpoint files now
+use semantic schema v2 and are validated against the target environment's
+ordered feature schema, exact action/exposure mapping, reward, execution,
+cost, risk, environment hash, instrument, config version, and policy ID.
+Walk-forward files also require a matching SHA-256 training receipt.
+
+Existing v1 checkpoints and paper cursor artifacts are preserved as historical
+receipts but are rejected by the current loader with an explicit migration or
+retraining error; there is no silent compatibility fallback. See
+`docs/t1_hardening.md` for the migration policy and regression evidence.
 
 ## GPU status and continuation
 
@@ -158,12 +175,14 @@ Quote polling is labelled **READ_ONLY_POLL**, not verified LIVE. Stale last-trad
 ## Files and limitations
 
 - `configs/default.json`: ₹10,000 balance; 25% single-name/gross cap; 2% daily loss lock; 10% drawdown lock; order-size/frequency guards; illustrative fee schedule.
-- `models/initial-v1/`: trained checkpoint, exact configuration/seed/data hash, untouched holdout receipt, walk-forward artifacts.
+- `models/initial-v1/`: preserved historical v1 checkpoint/evaluation receipt; current code rejects it without migration.
+- `models/initial-v2/`: current v2 demo checkpoint, pinned snapshot manifest, compatibility contract, holdout receipt and walk-forward artifacts.
 - `models/paper-replay-v2/`: subsequent replay-trained candidate and later evaluation.
 - `models/registry.sqlite`: immutable registrations and rejection/promotion/rollback history.
-- `runs/demo/`: SQLite account, detailed cost attribution, run receipt and diagnostic rule account.
+- `runs/demo/`: preserved historical v1 SQLite account and receipt.
+- `runs/demo-v2/`: current v2 SQLite account, detailed cost attribution, run receipt and diagnostic rule account.
 - `runs/active/`: separate safe cash account, not an unapproved candidate.
-- `docs/environment_report.md`, `docs/skills-audit.md`, `docs/test_report.md`, `docs/model_evaluation.md`: measured evidence and gaps.
+- `docs/environment_report.md`, `docs/skills-audit.md`, `docs/test_report.md`, `docs/model_evaluation.md`, `docs/t1_hardening.md`: measured evidence, hardening changes, and gaps.
 
 Checkpoints/data/logs and local virtual environments are ignored by Git; source/configuration/lockfiles/docs/tests are committed. No secrets or licensed datasets are committed. The main CLI uses `paper_env.PaperTradingEnv` and the canonical broker/ledger for training, evaluation and replay. `env.py` retains the small injected-execution reference environment for compatibility tests; it is not the CLI accounting engine.
 

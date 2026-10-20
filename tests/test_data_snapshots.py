@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from trading_agent.data import MarketBar, synthetic_bars
+from trading_agent.data import CSVBarProvider, MarketBar, synthetic_bars
 from trading_agent.data.persistence import SnapshotDependencyError, SnapshotError, load_snapshot, manifest_path, write_snapshot
 
 START = datetime(2026, 1, 5, 3, 45, tzinfo=timezone.utc)
@@ -38,6 +38,13 @@ def test_lossless_round_trip_and_manifest_source_range_hash(tmp_path, suffix):
     assert json.loads(manifest_path(path).read_text())["source_metadata"]["interval"] == "FIVE_MINUTE"
     with pytest.raises(TypeError):
         manifest.source_metadata["token"] = "never-stored"
+
+
+def test_canonical_csv_snapshot_round_trips_through_csv_provider(tmp_path):
+    path = tmp_path / "bars.csv"
+    write(path)
+    loaded = CSVBarProvider(path, captured_at=CAPTURED)
+    assert loaded.all_bars() == bars()
 
 
 def test_csv_is_reproducible_for_same_bars_metadata_and_capture_time(tmp_path):

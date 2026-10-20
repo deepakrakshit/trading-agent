@@ -1,6 +1,7 @@
 """Credential-free vertical slice: real training, evaluation, reload and gates."""
 
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import pytest
@@ -65,3 +66,73 @@ def test_train_resume_evaluate_baselines_and_fail_closed_promotion(tmp_path):
     with pytest.raises(ValueError, match="immutable"):
         train_experiment(data, output, config, resume=True)
     assert read_json(output / "experiment.json")["checkpoint_sha256"]
+
+
+def test_walk_forward_checkpoint_receipts_are_verified_before_reuse(tmp_path):
+    data = tmp_path / "candles.csv"
+    generate_synthetic(data, sessions=4)
+    output = tmp_path / "candidate-v1"
+    config = small_config()
+    train_experiment(data, output, config)
+    evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+    fold_dir = output / "walk_forward" / "fold-0-seed-0"
+    checkpoint = fold_dir / "candidate.pt"
+    receipt = fold_dir / "training.json"
+    original_checkpoint = checkpoint.read_bytes()
+    original_receipt = receipt.read_bytes()
+    substitute = (output / "walk_forward" / "fold-0-seed-1" / "candidate.pt").read_bytes()
+    evaluation = output / "evaluation.json"
+
+    checkpoint.write_bytes(b"modified checkpoint")
+    evaluation.unlink()
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+
+    checkpoint.write_bytes(substitute)
+    evaluation.unlink(missing_ok=True)
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+
+    checkpoint.write_bytes(original_checkpoint)
+    receipt.unlink()
+    evaluation.unlink(missing_ok=True)
+    with pytest.raises(ValueError, match="no training receipt"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+
+    receipt.write_bytes(original_receipt)
+    checkpoint.unlink()
+    evaluation.unlink(missing_ok=True)
+    with pytest.raises(ValueError, match="receipt exists without checkpoint"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+
+    checkpoint.write_bytes(original_checkpoint)
+    evaluation.unlink(missing_ok=True)
+    restored = evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+    assert restored["promotion"]["accepted"] is False
+
+
+def test_evaluation_rejects_replaced_snapshot_manifest(tmp_path):
+    data = tmp_path / "candles.csv"
+    generate_synthetic(data, sessions=4)
+    output = tmp_path / "candidate-v1"
+    config = small_config()
+    train_experiment(data, output, config, steps=8)
+    sidecar = Path(str(data) + ".manifest.json")
+    payload = json.loads(sidecar.read_text())
+    payload["source"] = "REPLACED_SOURCE"
+    sidecar.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+
+
+def test_consumed_evaluation_receipt_is_hash_checked(tmp_path):
+    data = tmp_path / "candles.csv"
+    generate_synthetic(data, sessions=4)
+    output = tmp_path / "candidate-v1"
+    config = small_config()
+    train_experiment(data, output, config, steps=8)
+    evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")
+    evaluation = output / "evaluation.json"
+    evaluation.write_text(evaluation.read_text() + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="receipt hash"):
+        evaluate_experiment(output, registry_path=tmp_path / "registry.sqlite")

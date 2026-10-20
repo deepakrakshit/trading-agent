@@ -122,3 +122,10 @@ Important limits:
 | CPU benchmark / failed GPU probe | `runs/benchmark.json`, `runs/gpu_verification.json` |
 
 The initial checkpoint SHA-256 is `5874174842bf554031eae42b06680d324df92e7a53db7677ee7f22067ca6ed53`; its source commit is `f8d88e38d64d56e92b79e251f0b562a506efefcc`. The replay checkpoint SHA-256 is `047bf5f2d2ec76547747691b90caecb216b310c4df9095629bc56989eef77e75`; its training source commit is `b2448765bbc4338a8ba2954ae3d33eb98fb9cb03`. Manifests also store complete configuration, seed, dependency versions, dataset hash and feature/action/reward schema. Convenience `candidate.pt` copies are not the immutable resume source of truth.
+
+The later T1 hardening work preserves these historical v1 artifacts and their
+holdout receipts. The current loader requires checkpoint schema v2 semantic
+compatibility metadata and rejects the old files rather than silently
+reinterpreting them. Reuse requires a new versioned training cycle or an
+independently reviewed migration; the historical scores above are not
+rewritten.

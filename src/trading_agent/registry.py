@@ -132,6 +132,7 @@ class PromotionEvidence:
     risk_ok: bool = False
     shadow_passed: bool = False
     recovery_passed: bool = False
+    receipts: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,13 +307,30 @@ class CandidateRegistry:
             reasons.append("already_incumbent")
         if not self._checkpoint_matches(self.get(policy_id)):
             reasons.append("checkpoint_missing_or_changed")
-        for name in ("accounting_ok", "data_integrity_ok", "risk_ok"):
-            if getattr(evidence, name) is not True:
-                reasons.append(name.removesuffix("_ok") + "_failed")
-        if gates.require_shadow and evidence.shadow_passed is not True:
-            reasons.append("shadow_failed")
-        if gates.require_recovery and evidence.recovery_passed is not True:
-            reasons.append("recovery_failed")
+        receipt_names = {
+            "accounting": "accounting_ok",
+            "data_integrity": "data_integrity_ok",
+            "risk": "risk_ok",
+            "shadow": "shadow_passed",
+            "recovery": "recovery_passed",
+        }
+        for receipt_name, flag_name in receipt_names.items():
+            if getattr(evidence, flag_name) is not True:
+                reasons.append(flag_name.removesuffix("_ok").removesuffix("_passed") + "_failed")
+            receipt = evidence.receipts.get(receipt_name) if isinstance(evidence.receipts, Mapping) else None
+            if not isinstance(receipt, Mapping):
+                reasons.append(f"{receipt_name}_receipt_missing_or_invalid")
+            elif (
+                receipt.get("version") != "promotion-evidence-v1"
+                or receipt.get("name") != receipt_name
+                or receipt.get("passed") is not True
+                or not isinstance(receipt.get("evaluation_id"), str)
+                or receipt.get("evaluation_id") != evidence.evaluation_id
+            ):
+                reasons.append(f"{receipt_name}_receipt_missing_or_invalid")
+        # Shadow/recovery are hard independent-evidence requirements.  The
+        # historical gate switches are retained for configuration provenance,
+        # but disabling them cannot turn missing safety receipts into approval.
         valid = _valid_metrics(metrics)
         if not valid:
             reasons.append("invalid_candidate_metrics")

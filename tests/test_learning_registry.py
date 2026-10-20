@@ -22,11 +22,20 @@ def summary(policy_id, net_return=0.06):
 
 
 def evidence(policy_id, *, incumbent=None, net_return=0.06, evaluation_id="trial-1"):
+    receipts = {
+        name: {
+            "version": "promotion-evidence-v1",
+            "name": name,
+            "passed": True,
+            "evaluation_id": evaluation_id,
+        }
+        for name in ("accounting", "data_integrity", "risk", "shadow", "recovery")
+    }
     return PromotionEvidence(
         evaluation_id, summary(policy_id, net_return),
         {"cash": summary("cash", 0), "rule": summary("rule", 0.01), "random": summary("random", -0.02)},
         incumbent, accounting_ok=True, data_integrity_ok=True, risk_ok=True,
-        shadow_passed=True, recovery_passed=True,
+        shadow_passed=True, recovery_passed=True, receipts=receipts,
     )
 
 
@@ -76,6 +85,28 @@ def test_safety_evidence_fails_closed_and_logs_rejection(tmp_path, flag, reason)
         assert not decision.accepted and reason in decision.reasons
         assert registry.active_policy_id is None
         assert registry.history()[-1]["kind"] == "rejected"
+
+
+def test_missing_versioned_receipts_fail_even_when_boolean_flags_are_true(tmp_path):
+    with CandidateRegistry(tmp_path / "registry.sqlite") as registry:
+        register(registry, tmp_path, "candidate")
+        decision = registry.consider("candidate", replace(evidence("candidate"), receipts={}))
+        assert not decision.accepted
+        assert "accounting_receipt_missing_or_invalid" in decision.reasons
+        assert "shadow_receipt_missing_or_invalid" in decision.reasons
+
+
+def test_disabling_shadow_and_recovery_gate_switches_cannot_bypass_hard_receipts(tmp_path):
+    gates = replace(PromotionGates(), require_shadow=False, require_recovery=False)
+    with CandidateRegistry(tmp_path / "registry.sqlite", gates=gates) as registry:
+        register(registry, tmp_path, "candidate")
+        decision = registry.consider(
+            "candidate",
+            replace(evidence("candidate"), shadow_passed=False, recovery_passed=False, receipts={}),
+        )
+        assert not decision.accepted
+        assert "shadow_failed" in decision.reasons
+        assert "recovery_failed" in decision.reasons
 
 
 @pytest.mark.parametrize("metric,value,reason", [

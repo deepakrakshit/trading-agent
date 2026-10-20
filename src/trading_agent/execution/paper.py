@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR
 from enum import Enum
 import json
@@ -171,7 +171,7 @@ class PaperBroker:
     """
 
     STATE_KEY = "paper_broker_v1"
-    EXECUTION_VERSION = "causal-open-v2"
+    EXECUTION_VERSION = "causal-open-v3"
     _STATE_KEY = STATE_KEY
 
     def __init__(
@@ -182,6 +182,7 @@ class PaperBroker:
         repository: SQLiteRepository | None = None,
         risk_supervisor: RiskSupervisor | None = None,
         participation_limit: Decimal | str | float = Decimal("1"),
+        bar_interval: timedelta = timedelta(minutes=5),
     ) -> None:
         self.ledger = ledger
         self.cost_model = cost_model or CostModel()
@@ -190,11 +191,15 @@ class PaperBroker:
         self.participation_limit = decimal_value(participation_limit, "participation_limit")
         if not 0 < self.participation_limit <= 1:
             raise ValueError("participation_limit must be in (0, 1]")
+        if bar_interval <= timedelta(0):
+            raise ValueError("bar_interval must be positive")
+        self.bar_interval = bar_interval
         self._requests: dict[str, OrderRequest] = {}
         self._receipts: dict[str, ExecutionReceipt] = {}
         self._last_bars: dict[str, MarketBar] = {}
         self._last_opens: dict[str, PaperOpenEvent] = {}
         self._sequence = 0
+        self._last_clock: datetime | None = None
         self._session: str | None = None
         self._session_start_equity = self.ledger.snapshot().equity
         if repository is not None:
@@ -382,7 +387,9 @@ class PaperBroker:
             results = self.process_open(
                 PaperOpenEvent(bar.symbol, bar.timestamp, bar.open), as_of=as_of
             )
-            self.observe_bar(bar, as_of=as_of)
+            completed_at = bar.timestamp + self.bar_interval
+            observation_clock = completed_at if as_of is None else max(utc_timestamp(as_of), completed_at)
+            self.observe_bar(bar, as_of=observation_clock)
         return results
 
     def process_open(
@@ -396,6 +403,7 @@ class PaperBroker:
         """
 
         clock = utc_timestamp(as_of or event.timestamp)
+        self._assert_clock(clock)
         previous_open = self._last_opens.get(event.symbol)
         if previous_open is not None and event.timestamp <= previous_open.timestamp:
             if event == previous_open:
@@ -415,8 +423,8 @@ class PaperBroker:
         )
         results: list[ExecutionReceipt] = []
         with self.atomic():
-            self._begin_session(event.timestamp)
             self.ledger.mark_to_market({event.symbol: event.price}, timestamp=event.timestamp)
+            self._begin_session(event.timestamp)
             for order in self.pending_orders():
                 if (
                     order.symbol != event.symbol or event.timestamp <= order.submitted_at
@@ -467,7 +475,7 @@ class PaperBroker:
                 )
                 self._receipts[order.client_order_id] = receipt
                 if fill:
-                    self.ledger.restore_state(candidate.export_state())
+                    self.ledger.adopt(candidate)
                     self.risk_supervisor.record_execution(event.timestamp)
                 if self.repository:
                     self.repository.update_order_status(order.client_order_id, receipt.status.value)
@@ -484,6 +492,7 @@ class PaperBroker:
                     self._record_event("RISK", order.client_order_id, asdict(decision), clock)
                 results.append(receipt)
             self._last_opens[event.symbol] = event
+            self._last_clock = clock
             self.risk_supervisor.evaluate(
                 self._weights(self.ledger), self._risk_context(self.ledger, event, clock)
             )
@@ -493,7 +502,11 @@ class PaperBroker:
     def observe_bar(self, bar: MarketBar, *, as_of: datetime | None = None) -> None:
         """Observe a completed candle without retroactively placing any fill."""
 
-        clock = utc_timestamp(as_of or bar.timestamp)
+        completed_at = bar.timestamp + self.bar_interval
+        clock = utc_timestamp(as_of or completed_at)
+        if clock < completed_at:
+            raise ValueError("cannot observe a completed bar before its availability time")
+        self._assert_clock(clock)
         previous = self._last_bars.get(bar.symbol)
         if previous is not None and bar.timestamp <= previous.timestamp:
             if bar == previous:
@@ -502,20 +515,21 @@ class PaperBroker:
         if bar.timestamp > clock:
             raise ValueError("cannot observe a future/unavailable bar")
         with self.atomic():
+            self.ledger.mark_to_market({bar.symbol: bar.close}, timestamp=completed_at)
             self._begin_session(bar.timestamp)
-            self.ledger.mark_to_market({bar.symbol: bar.close}, timestamp=bar.timestamp)
             self._last_bars[bar.symbol] = bar
             closing_risk = self.risk_supervisor.evaluate(
                 self._weights(self.ledger), self._risk_context(self.ledger, bar, clock)
             )
             if self.repository:
                 self.repository.record_snapshot(
-                    self.ledger.snapshot().to_mapping(), occurred_at=bar.timestamp
+                    self.ledger.snapshot().to_mapping(), occurred_at=completed_at
                 )
                 self._record_event(
                     "MARKET_RISK", f"{bar.symbol}:{bar.timestamp.isoformat()}",
-                    asdict(closing_risk), clock,
+                    asdict(closing_risk), completed_at,
                 )
+            self._last_clock = clock
             self.checkpoint()
 
     def _begin_session(self, timestamp: datetime) -> None:
@@ -595,13 +609,18 @@ class PaperBroker:
         snapshot = ledger.snapshot()
         return RiskContext(
             timestamp=clock,
-            feed_timestamp=bar.timestamp,
+            feed_timestamp=(
+                bar.timestamp + self.bar_interval
+                if isinstance(bar, MarketBar)
+                else bar.timestamp
+            ),
             cash=snapshot.cash,
             equity=snapshot.equity,
             high_water_mark=snapshot.high_water_mark,
             session_start_equity=self._session_start_equity,
             positions={symbol: position.quantity for symbol, position in snapshot.positions.items()},
             marks=ledger.last_prices,
+            event_timestamp=bar.timestamp,
         )
 
     @staticmethod
@@ -626,6 +645,7 @@ class PaperBroker:
             "cost_model": asdict(self.cost_model),
             "risk_limits": asdict(self.risk_supervisor.limits),
             "participation_limit": str(self.participation_limit),
+            "bar_interval": self.bar_interval.total_seconds(),
         }
         return json.loads(json.dumps(values, default=canonical, sort_keys=True))
 
@@ -641,6 +661,7 @@ class PaperBroker:
             "risk": self.risk_supervisor.export_state(),
             "session": self._session,
             "session_start_equity": str(self._session_start_equity),
+            "last_clock": self._last_clock.isoformat() if self._last_clock else None,
         }
 
     def _restore(self, state: Mapping[str, Any]) -> None:
@@ -660,3 +681,9 @@ class PaperBroker:
         self.risk_supervisor.restore_state(state["risk"])
         self._session = state["session"]
         self._session_start_equity = Decimal(state["session_start_equity"])
+        raw_clock = state.get("last_clock")
+        self._last_clock = utc_timestamp(datetime.fromisoformat(raw_clock)) if raw_clock else None
+
+    def _assert_clock(self, clock: datetime) -> None:
+        if self._last_clock is not None and clock < self._last_clock:
+            raise ValueError("execution clock cannot move backwards")
